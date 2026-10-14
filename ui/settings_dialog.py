@@ -1,0 +1,306 @@
+"""Settings Dialog for CoremailAssistant.
+Configures IMAP/SMTP server connection, credentials, polling intervals,
+Machine Learning status & model reset, and local Ollama parameters.
+"""
+
+from typing import Dict, Any, Optional
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QPushButton, QCheckBox, QSpinBox, QComboBox, QGroupBox,
+    QMessageBox, QScrollArea, QWidget
+)
+
+from core.database import DatabaseManager
+from core.mail_client import CoremailClient
+from core.ml_learner import LocalEmailLearner
+from core.ollama_client import OllamaClient
+
+
+class SettingsDialog(QDialog):
+    """系统与邮箱配置对话框"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.db = DatabaseManager()
+        self.learner = LocalEmailLearner()
+
+        self.setWindowTitle("系统设置 - CoremailAssistant")
+        self.resize(750, 680)
+        self._init_ui()
+        self._load_settings()
+
+    def _init_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(10)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+
+        content_widget = QWidget()
+        layout = QVBoxLayout(content_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(12)
+
+        # 1. 邮箱服务器与账号凭证
+        mail_group = QGroupBox("论客邮箱 (Coremail) 服务器与账号设置")
+        mail_layout = QVBoxLayout(mail_group)
+
+        # IMAP
+        imap_row = QHBoxLayout()
+        imap_row.addWidget(QLabel("IMAP 主机："))
+        self.imap_host = QLineEdit()
+        self.imap_host.setPlaceholderText("例如 mail.company.com")
+        imap_row.addWidget(self.imap_host, 2)
+        imap_row.addWidget(QLabel("端口："))
+        self.imap_port = QSpinBox()
+        self.imap_port.setRange(1, 65535)
+        self.imap_port.setValue(993)
+        imap_row.addWidget(self.imap_port)
+        self.imap_ssl = QCheckBox("SSL 加密")
+        self.imap_ssl.setChecked(True)
+        imap_row.addWidget(self.imap_ssl)
+        mail_layout.addLayout(imap_row)
+
+        # SMTP
+        smtp_row = QHBoxLayout()
+        smtp_row.addWidget(QLabel("SMTP 主机："))
+        self.smtp_host = QLineEdit()
+        self.smtp_host.setPlaceholderText("例如 mail.company.com")
+        smtp_row.addWidget(self.smtp_host, 2)
+        smtp_row.addWidget(QLabel("端口："))
+        self.smtp_port = QSpinBox()
+        self.smtp_port.setRange(1, 65535)
+        self.smtp_port.setValue(465)
+        smtp_row.addWidget(self.smtp_port)
+        self.smtp_ssl = QCheckBox("SSL 加密")
+        self.smtp_ssl.setChecked(True)
+        smtp_row.addWidget(self.smtp_ssl)
+        mail_layout.addLayout(smtp_row)
+
+        # 账号凭据
+        acc_row = QHBoxLayout()
+        acc_row.addWidget(QLabel("邮箱账号："))
+        self.email_account = QLineEdit()
+        self.email_account.setPlaceholderText("your_name@company.com")
+        acc_row.addWidget(self.email_account, 2)
+        acc_row.addWidget(QLabel("密码/授权码："))
+        self.email_password = QLineEdit()
+        self.email_password.setEchoMode(QLineEdit.Password)
+        self.email_password.setPlaceholderText("论客邮箱登录密码或客户端专用码")
+        acc_row.addWidget(self.email_password, 2)
+        mail_layout.addLayout(acc_row)
+
+        disp_row = QHBoxLayout()
+        disp_row.addWidget(QLabel("发件人显示姓名："))
+        self.sender_display_name = QLineEdit()
+        self.sender_display_name.setPlaceholderText("例如 张三 (发信时在收件方显示的中文名)")
+        disp_row.addWidget(self.sender_display_name, 1)
+
+        btn_test = QPushButton("🔌 测试连接 (IMAP/SMTP)")
+        btn_test.clicked.connect(self._test_connection)
+        disp_row.addWidget(btn_test)
+        mail_layout.addLayout(disp_row)
+
+        layout.addWidget(mail_group)
+
+        # 2. 自动化轮询与智能化模式
+        auto_group = QGroupBox("自动化收信与处理模式")
+        auto_layout = QVBoxLayout(auto_group)
+
+        poll_row = QHBoxLayout()
+        poll_row.addWidget(QLabel("后台自动收信轮询间隔："))
+        self.poll_interval = QSpinBox()
+        self.poll_interval.setRange(15, 3600)
+        self.poll_interval.setValue(60)
+        self.poll_interval.setSuffix(" 秒")
+        poll_row.addWidget(self.poll_interval)
+
+        poll_row.addWidget(QLabel("流转初筛模式："))
+        self.filter_mode = QComboBox()
+        self.filter_mode.addItem("规则优先 + 本地机器学习兜底 (推荐)", "rules_and_ml")
+        self.filter_mode.addItem("纯本地全文机器学习 (无须写规则)", "ml_only")
+        self.filter_mode.addItem("仅关键词匹配规则", "rules_only")
+        self.filter_mode.addItem("本地初筛 + Ollama 大模型深度润色", "ollama_hybrid")
+        poll_row.addWidget(self.filter_mode, 1)
+        auto_layout.addLayout(poll_row)
+
+        behav_row = QHBoxLayout()
+        self.chk_auto_read = QCheckBox("邮件流转成功后自动标记为已读")
+        behav_row.addWidget(self.chk_auto_read)
+        self.chk_cc_sender = QCheckBox("默认勾选抄送原发件人 A")
+        behav_row.addWidget(self.chk_cc_sender)
+        behav_row.addStretch()
+        auto_layout.addLayout(behav_row)
+
+        layout.addWidget(auto_group)
+
+        # 3. 本地机器学习引擎状态面板
+        ml_group = QGroupBox("🤖 全文增量机器学习引擎状态面板")
+        ml_layout = QVBoxLayout(ml_group)
+
+        self.ml_status_lbl = QLabel()
+        self.ml_status_lbl.setStyleSheet("color: #475569; line-height: 1.6;")
+        self._refresh_ml_status()
+        ml_layout.addWidget(self.ml_status_lbl)
+
+        ml_btn_box = QHBoxLayout()
+        btn_refresh_ml = QPushButton("🔄 刷新状态")
+        btn_refresh_ml.clicked.connect(self._refresh_ml_status)
+        btn_reset_ml = QPushButton("🗑️ 重置/清空本地模型")
+        btn_reset_ml.setObjectName("btn_danger")
+        btn_reset_ml.setProperty("danger", True)
+        btn_reset_ml.clicked.connect(self._reset_ml_models)
+
+        ml_btn_box.addWidget(btn_refresh_ml)
+        ml_btn_box.addWidget(btn_reset_ml)
+        ml_btn_box.addStretch()
+        ml_layout.addLayout(ml_btn_box)
+
+        layout.addWidget(ml_group)
+
+        # 4. 本地大模型 (Ollama) 配置
+        ollama_group = QGroupBox("🦙 本地大模型 (Ollama) 深度扩展")
+        ollama_layout = QVBoxLayout(ollama_group)
+
+        self.chk_ollama = QCheckBox("启用本地 Ollama 进行复杂语义摘要与主语深度润色")
+        ollama_layout.addWidget(self.chk_ollama)
+
+        ol_row = QHBoxLayout()
+        ol_row.addWidget(QLabel("服务地址："))
+        self.ollama_url = QLineEdit("http://127.0.0.1:11434")
+        ol_row.addWidget(self.ollama_url, 1)
+
+        ol_row.addWidget(QLabel("模型名称："))
+        self.ollama_model = QLineEdit("qwen2.5:3b")
+        ol_row.addWidget(self.ollama_model, 1)
+
+        btn_detect_ol = QPushButton("🔍 检测 Ollama 服务")
+        btn_detect_ol.clicked.connect(self._detect_ollama)
+        ol_row.addWidget(btn_detect_ol)
+        ollama_layout.addLayout(ol_row)
+
+        layout.addWidget(ollama_group)
+
+        scroll.setWidget(content_widget)
+        main_layout.addWidget(scroll, 1)
+
+        # 5. 底部保存与取消按钮
+        bottom_bar = QHBoxLayout()
+        bottom_bar.addStretch()
+
+        btn_cancel = QPushButton("取消")
+        btn_cancel.clicked.connect(self.reject)
+        bottom_bar.addWidget(btn_cancel)
+
+        btn_save = QPushButton("💾 保存配置")
+        btn_save.setObjectName("btn_primary")
+        btn_save.setProperty("primary", True)
+        btn_save.clicked.connect(self._save_settings)
+        bottom_bar.addWidget(btn_save)
+
+        main_layout.addLayout(bottom_bar)
+
+    def _refresh_ml_status(self):
+        sample_count = self.db.get_sample_count()
+        diff_count = self.db.get_learned_diff_rules_count()
+        is_fitted = "已启动增量训练" if self.learner.action_fitted else "待积累训练样本"
+
+        self.ml_status_lbl.setText(
+            f"• <b>模型运行状态：</b>{is_fitted}<br>"
+            f"• <b>已学习历史邮件全文样本数：</b>{sample_count} 封<br>"
+            f"• <b>从全文编辑 Diff 中自动学习到的改写短语：</b>{diff_count} 条<br>"
+            f"• <b>硬件开销评估：</b>纯 CPU 在线轻量级提取，内存占用 &lt;60MB，预测延迟 &lt;10ms"
+        )
+
+    def _reset_ml_models(self):
+        if QMessageBox.question(
+            self, "确认重置",
+            "确定要重置本地机器学习模型吗？这将清空当前学习到的预测权重（数据库历史样本与规则不会删除）。",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        ) == QMessageBox.Yes:
+            self.learner.reset_models()
+            self._refresh_ml_status()
+            QMessageBox.information(self, "重置完成", "本地机器学习模型已重置为初始状态")
+
+    def _test_connection(self):
+        cfg = {
+            "imap_host": self.imap_host.text().strip(),
+            "imap_port": self.imap_port.value(),
+            "imap_ssl": self.imap_ssl.isChecked(),
+            "smtp_host": self.smtp_host.text().strip(),
+            "smtp_port": self.smtp_port.value(),
+            "smtp_ssl": self.smtp_ssl.isChecked(),
+            "email_account": self.email_account.text().strip(),
+            "email_password": self.email_password.text(),
+        }
+        client = CoremailClient(cfg)
+        res = client.test_connection()
+        if res.get("ok"):
+            QMessageBox.information(self, "连接成功", res.get("msg"))
+        else:
+            QMessageBox.critical(self, "连接失败", res.get("msg"))
+
+    def _detect_ollama(self):
+        client = OllamaClient(
+            base_url=self.ollama_url.text().strip(),
+            default_model=self.ollama_model.text().strip()
+        )
+        if client.is_available():
+            models = client.list_local_models()
+            models_str = ", ".join(models) if models else "服务正常（暂未检测到已下载模型）"
+            QMessageBox.information(self, "检测成功", f"Ollama 服务运行正常！\n本地可用模型: {models_str}")
+        else:
+            QMessageBox.warning(self, "检测提示", "无法连接到 Ollama 服务，请确认后台是否已启动 ollama")
+
+    def _load_settings(self):
+        st = self.db.get_all_settings()
+        self.imap_host.setText(st.get("imap_host", ""))
+        self.imap_port.setValue(int(st.get("imap_port", 993) or 993))
+        self.imap_ssl.setChecked(st.get("imap_ssl", "1") == "1")
+
+        self.smtp_host.setText(st.get("smtp_host", ""))
+        self.smtp_port.setValue(int(st.get("smtp_port", 465) or 465))
+        self.smtp_ssl.setChecked(st.get("smtp_ssl", "1") == "1")
+
+        self.email_account.setText(st.get("email_account", ""))
+        self.email_password.setText(st.get("email_password", ""))
+        self.sender_display_name.setText(st.get("sender_display_name", ""))
+
+        self.poll_interval.setValue(int(st.get("poll_interval", 60) or 60))
+        self.chk_auto_read.setChecked(st.get("auto_mark_read", "0") == "1")
+        self.chk_cc_sender.setChecked(st.get("default_include_sender_in_cc", "1") == "1")
+
+        mode = st.get("filter_mode", "rules_and_ml")
+        idx = self.filter_mode.findData(mode)
+        if idx >= 0:
+            self.filter_mode.setCurrentIndex(idx)
+
+        self.chk_ollama.setChecked(st.get("ollama_enabled", "0") == "1")
+        self.ollama_url.setText(st.get("ollama_url", "http://127.0.0.1:11434"))
+        self.ollama_model.setText(st.get("ollama_model", "qwen2.5:3b"))
+
+    def _save_settings(self):
+        data = {
+            "imap_host": self.imap_host.text().strip(),
+            "imap_port": str(self.imap_port.value()),
+            "imap_ssl": "1" if self.imap_ssl.isChecked() else "0",
+            "smtp_host": self.smtp_host.text().strip(),
+            "smtp_port": str(self.smtp_port.value()),
+            "smtp_ssl": "1" if self.smtp_ssl.isChecked() else "0",
+            "email_account": self.email_account.text().strip(),
+            "email_password": self.email_password.text(),
+            "sender_display_name": self.sender_display_name.text().strip(),
+            "poll_interval": str(self.poll_interval.value()),
+            "auto_mark_read": "1" if self.chk_auto_read.isChecked() else "0",
+            "default_include_sender_in_cc": "1" if self.chk_cc_sender.isChecked() else "0",
+            "filter_mode": self.filter_mode.currentData(),
+            "ollama_enabled": "1" if self.chk_ollama.isChecked() else "0",
+            "ollama_url": self.ollama_url.text().strip(),
+            "ollama_model": self.ollama_model.text().strip(),
+        }
+        self.db.update_settings(data)
+        QMessageBox.information(self, "保存成功", "系统配置已成功保存！")
+        self.accept()
