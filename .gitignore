@@ -1,0 +1,77 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment and sensitive configuration
+.env
+.env.*
+!.env.example
+config/config.yaml
+config/rules.yaml
+
+# Data files & Local SQLite DB & Machine Learning Models
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.pkl
+data/attachments/*
+!data/attachments/.gitkeep
+!data/.gitkeep
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+
+# Logs and runtime data
+logs/*.log
+logs/*.txt
+!logs/.gitkeep
+temp/
+attachments/
+output/
+
+# Operating system files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/

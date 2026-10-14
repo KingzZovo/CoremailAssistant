@@ -1,0 +1,47 @@
+# 论客邮箱 (Coremail) 邮件自动处理工具 - 全局配置文件
+# 复制为 config.yaml 后使用
+
+mail_server:
+  # 论客邮箱服务器地址 (通常为 mail.域名 或 imap.域名)
+  imap_host: "mail.example.com"
+  imap_port: 993
+  use_ssl: true
+
+  # SMTP 发信服务器 (可选，用于自动回复或邮件转发)
+  smtp_host: "mail.example.com"
+  smtp_port: 465
+  smtp_use_ssl: true
+
+  # 登录账号凭证 (推荐通过 .env 注入或在此配置)
+  username: "your_email@example.com"
+  # 注意：部分论客邮箱启用了双重认证或客户端专用授权码
+  password: "your_password_or_auth_code"
+
+  # 待监控的邮箱文件夹 (默认为收件箱 INBOX)
+  folder: "INBOX"
+
+scheduler:
+  # 轮询间隔 (单位：秒)，建议不低于 30 秒，避免被服务器限流
+  poll_interval: 60
+  # 每次拉取的最大未读邮件数量
+  batch_size: 20
+  # 处理完成后是否标记为已读
+  mark_as_read: true
+  # 处理完成后移动到的目标文件夹 (留空为 null 则不移动)
+  move_to_folder: null
+
+storage:
+  # 附件默认保存路径 (支持 Windows 绝对路径或相对路径)
+  attachment_dir: "./attachments"
+  # 导出报表或数据输出目录
+  output_dir: "./output"
+  # 日志存储目录
+  log_dir: "./logs"
+
+logging:
+  level: "INFO"       # DEBUG, INFO, WARNING, ERROR
+  rotation: "10 MB"   # 单个日志文件大小
+  retention: "14 days" # 日志保留天数
+
+# 规则配置文件路径
+rules_file: "./config/rules.yaml"

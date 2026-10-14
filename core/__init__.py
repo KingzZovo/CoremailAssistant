@@ -1,0 +1,1 @@
+"""CoremailAssistant core module."""

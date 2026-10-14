@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coremail-auto-processor"
+version = "0.1.0"
+description = "Windows 环境下论客邮箱 (Coremail) 邮件自动化处理工具"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [
+    { name = "Developer" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Communications :: Email",
+    "Topic :: Office/Business",
+]
+dependencies = [
+    "imapclient>=3.0.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "pyyaml>=6.0.1",
+    "loguru>=0.7.2",
+    "python-dotenv>=1.0.1",
+    "schedule>=1.2.1",
+    "openpyxl>=3.1.2",
+    "charset-normalizer>=3.3.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.1.0",
+    "pytest-cov>=5.0.0",
+    "ruff>=0.4.0",
+    "black>=24.3.0",
+    "mypy>=1.9.0",
+]
+
+[project.scripts]
+coremail-processor = "coremail_processor.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

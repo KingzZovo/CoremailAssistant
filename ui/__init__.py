@@ -1,0 +1,1 @@
+"""CoremailAssistant UI module."""

@@ -1,0 +1,45 @@
+# 论客邮箱 (Coremail) 邮件处理规则配置文件
+# 支持按优先级、多重匹配条件 (发件人、主题、正文、附件类型) 执行相应动作
+
+rules:
+  - name: "自动保存财务发票附件"
+    enabled: true
+    priority: 10
+    match_mode: "any" # all (同时满足) 或 any (满足任一)
+    conditions:
+      - field: "subject"
+        operator: "contains"
+        value: "发票"
+      - field: "subject"
+        operator: "contains"
+        value: "电子发票"
+    actions:
+      - type: "save_attachments"
+        params:
+          destination: "./attachments/invoices/{YYYY}-{MM}"
+          allowed_extensions: [".pdf", ".ofd", ".zip", ".png", ".jpg"]
+          rename_pattern: "{date}_{sender}_{filename}"
+      - type: "mark_read"
+      - type: "log"
+        params:
+          message: "已成功提取发票邮件附件"
+
+  - name: "业务报表自动归档与通知"
+    enabled: false
+    priority: 20
+    match_mode: "all"
+    conditions:
+      - field: "sender"
+        operator: "contains"
+        value: "report@company.com"
+      - field: "subject"
+        operator: "contains"
+        value: "日报"
+    actions:
+      - type: "save_attachments"
+        params:
+          destination: "./attachments/daily_reports"
+          allowed_extensions: [".xlsx", ".xls", ".csv"]
+      - type: "move_folder"
+        params:
+          target_folder: "日报归档"
