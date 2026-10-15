@@ -82,6 +82,7 @@ jobs:
           $Tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.4" }
           $VerNum = $Tag.TrimStart("v")
           
+          New-Item -ItemType Directory -Force -Path "dist_installer" | Out-Null
           Write-Output "Compiling Inno Setup Installer for version $VerNum..."
           & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" /DMyAppVersion=$VerNum installer/setup.iss
 
@@ -106,6 +107,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
+          tag_name: ${{ github.ref_name }}
           files: |
             dist_installer/CoremailAssistant-Setup-*.exe
             CoremailAssistant-*-Portable.7z

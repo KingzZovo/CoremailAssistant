@@ -53,7 +53,7 @@ WizardStyle=modern
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
@@ -63,8 +63,6 @@ Name: "startmenuicon"; Description: "创建开始菜单快捷方式"; GroupDescr
 [Files]
 ; 打包主执行程序与运行时动态库
 Source: "..\dist\CoremailAssistant\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
-; 配置文件与数据目录（覆盖升级时不覆盖已有数据库）
-Source: "..\dist\CoremailAssistant\data\*"; DestDir: "{app}\data"; Flags: onlyifdestdoesntexist recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\{#MyAppDisplayName}"; Filename: "{app}\{#MyAppExeName}"
