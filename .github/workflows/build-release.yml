@@ -1,0 +1,74 @@
+name: Build and Release Windows Executable
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Standalone Windows x64 Application
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Build Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build Windows Application with PyInstaller
+        run: |
+          pyinstaller --noconfirm --onedir --windowed `
+            --name "CoremailAssistant" `
+            --collect-all PySide6 `
+            --collect-all jieba `
+            --collect-all sklearn `
+            --collect-all scipy `
+            --copy-metadata scikit-learn `
+            --add-data "config.py;." `
+            main.py
+
+      - name: Package Release Assets
+        shell: pwsh
+        run: |
+          # Copy essential config templates and launchers
+          Copy-Item -Path "README.md" -Destination "dist/CoremailAssistant/"
+          Copy-Item -Path ".env.example" -Destination "dist/CoremailAssistant/"
+          if (Test-Path "config/config.example.yaml") {
+            New-Item -ItemType Directory -Force -Path "dist/CoremailAssistant/config"
+            Copy-Item -Path "config/config.example.yaml" -Destination "dist/CoremailAssistant/config/"
+          }
+          if (Test-Path "config/rules.example.yaml") {
+            Copy-Item -Path "config/rules.example.yaml" -Destination "dist/CoremailAssistant/config/"
+          }
+          
+          # Create friendly Windows launcher batch
+          Set-Content -Path "dist/CoremailAssistant/启动论客助手.bat" -Value "@echo off`r`nstart CoremailAssistant.exe" -Encoding utf8
+          
+          # Compress to zip
+          $Tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
+          $ZipName = "CoremailAssistant-$Tag-Windows-x64.zip"
+          Compress-Archive -Path "dist/CoremailAssistant/*" -DestinationPath $ZipName -Force
+          Write-Output "ZIP_NAME=$ZipName" >> $env:GITHUB_ENV
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ env.ZIP_NAME }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

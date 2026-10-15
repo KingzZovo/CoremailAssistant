@@ -1,5 +1,6 @@
 # CoremailAssistant (论客邮箱智能协同与邮件自动处理助手)
 
+[![GitHub Release](https://img.shields.io/github/v/release/KingzZovo/CoremailAssistant?color=blue&logo=github)](https://github.com/KingzZovo/CoremailAssistant/releases)
 [![Python Version](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
 [![UI Framework](https://img.shields.io/badge/UI-PySide6%20(Qt6)-green.svg)](https://wiki.qt.io/Qt_for_Python)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-lightgrey.svg)](https://www.microsoft.com/windows)
@@ -70,6 +71,18 @@ CoremailAssistant/
     ├── test_parser.py           # 编码解码与邮件解析测试
     └── test_rules.py            # 规则匹配与条件引擎测试
 ```
+
+---
+
+## 📥 下载地址与打包发布 (GitHub Releases)
+
+前往 GitHub 官方 Releases 页面直接下载已打包版本：
+👉 **[下载最新发布版本 (Releases)](https://github.com/KingzZovo/CoremailAssistant/releases)**
+
+| 下载文件 | 说明 | 适用场景 |
+| :--- | :--- | :--- |
+| **`CoremailAssistant-v1.0.0-Windows-x64.zip`** | 包含编译打包后的独立可执行文件（`.exe`），**无需安装 Python**，解压后双击即用 | 生产环境 / 普通 Windows 用户 |
+| **`CoremailAssistant-v1.0.0-Portable.zip`** | 便携源码整合包，内含 Windows 一键安装与启动脚本（`一键安装并启动.bat`） | 开发者 / 需要自定义规则与调试的用户 |
 
 ---
 
