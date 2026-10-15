@@ -8,9 +8,11 @@ import re
 import time
 import uuid
 import base64
+import socket
 import imaplib
 import smtplib
 import email
+from urllib.parse import urlparse
 from email.header import decode_header, make_header
 from email.utils import getaddresses, formataddr, formatdate, make_msgid
 from email.mime.multipart import MIMEMultipart
@@ -70,16 +72,119 @@ def parse_address_list(header_values: List[str]) -> List[Dict[str, str]]:
     return result
 
 
+def normalize_host_and_port(raw_host: str, default_port: int = 143) -> Tuple[str, int]:
+    """
+    清洗用户在设置中填写的服务器地址，防止因包含 http://、端口号或路径导致 Windows 报 Errno 11001。
+    例如输入 'http://192.168.1.50:8080/coremail/' -> 返回 ('192.168.1.50', 8080)
+    输入 'mail.corp.local:993' -> 返回 ('mail.corp.local', 993)
+    输入 'mail.corp.local' -> 返回 ('mail.corp.local', default_port)
+    """
+    if not raw_host:
+        return "", default_port
+    s = raw_host.strip()
+    if "://" not in s:
+        s = "http://" + s
+    try:
+        parsed = urlparse(s)
+        clean_host = (parsed.hostname or "").strip()
+        port = parsed.port if parsed.port is not None else default_port
+        return clean_host, port
+    except Exception:
+        m = re.match(r"^(?:https?://)?([^:/]+)(?::(\d+))?", raw_host.strip(), re.IGNORECASE)
+        if m:
+            clean_host = m.group(1).strip()
+            port = int(m.group(2)) if m.group(2) else default_port
+            return clean_host, port
+        return raw_host.strip(), default_port
+
+
+def probe_coremail_server_ports(raw_host: str) -> Dict[str, Any]:
+    """
+    针对内网/专有 Coremail 服务器一键探测实际开放的收发端口（解决内网未开 SSL 993/465 而是开 143/25 的情况）
+    """
+    clean_host, _ = normalize_host_and_port(raw_host, 143)
+    if not clean_host:
+        return {"ok": False, "msg": "服务器地址不能为空，请填写论客客户端中的服务器 IP 或域名。"}
+
+    # 第一步：验证 DNS / IP 解析（捕获 Errno 11001）
+    try:
+        resolved_ip = socket.gethostbyname(clean_host)
+    except socket.gaierror as e:
+        err_no = getattr(e, "errno", 11001)
+        return {
+            "ok": False,
+            "host": clean_host,
+            "msg": (
+                f"无法解析服务器地址「{clean_host}」(Errno {err_no})。\n"
+                f"原因：当前内网 DNS 无法识别该域名，或地址格式不正确。\n"
+                f"建议：请打开论客客户端【设置 -> 帐号管理】查看真实服务器地址，或直接填写邮件服务器的内网 IP 地址。"
+            )
+        }
+
+    def is_port_open(port: int) -> bool:
+        try:
+            with socket.create_connection((resolved_ip, port), timeout=2.0):
+                return True
+        except Exception:
+            return False
+
+    # 第二步：探测 IMAP 端口（优先 993 SSL，其次 143 明文）
+    if is_port_open(993):
+        imap_port, imap_ssl = 993, True
+    elif is_port_open(143):
+        imap_port, imap_ssl = 143, False
+    else:
+        imap_port, imap_ssl = 143, False
+
+    # 第三步：探测 SMTP 端口（优先 465 SSL，其次 25 明文，再次 587）
+    if is_port_open(465):
+        smtp_port, smtp_ssl = 465, True
+    elif is_port_open(25):
+        smtp_port, smtp_ssl = 25, False
+    elif is_port_open(587):
+        smtp_port, smtp_ssl = 587, False
+    else:
+        smtp_port, smtp_ssl = 25, False
+
+    ssl_imap_text = "开启" if imap_ssl else "关闭"
+    ssl_smtp_text = "开启" if smtp_ssl else "关闭"
+    return {
+        "ok": True,
+        "host": clean_host,
+        "resolved_ip": resolved_ip,
+        "imap_port": imap_port,
+        "imap_ssl": imap_ssl,
+        "smtp_port": smtp_port,
+        "smtp_ssl": smtp_ssl,
+        "msg": f"探测成功 (解析到 IP: {resolved_ip})：\n推荐 IMAP 端口 {imap_port} (SSL={ssl_imap_text})，\nSMTP 端口 {smtp_port} (SSL={ssl_smtp_text})"
+    }
+
+
+auto_detect_server = probe_coremail_server_ports
+
+
 class CoremailClient:
     """Coremail 论客邮箱 IMAP/SMTP 客户端封装（支持富文本 HTML 及内联图片发送）"""
 
-    def __init__(self, config: Dict[str, Any], attachment_root: str = "data/attachments"):
-        self.imap_host = config.get("imap_host", "").strip()
-        self.imap_port = int(config.get("imap_port", 993) or 993)
-        self.imap_ssl = str(config.get("imap_ssl", "1")).lower() in ("1", "true", "yes")
+    normalize_host_and_port = staticmethod(normalize_host_and_port)
+    probe_coremail_server_ports = staticmethod(probe_coremail_server_ports)
+    auto_detect_server = staticmethod(probe_coremail_server_ports)
 
-        self.smtp_host = config.get("smtp_host", "").strip()
-        self.smtp_port = int(config.get("smtp_port", 465) or 465)
+    def __init__(self, config: Dict[str, Any], attachment_root: str = "data/attachments"):
+        self.protocol_mode = config.get("protocol_mode", "coremail")
+        coremail_srv = config.get("coremail_server", "").strip()
+
+        # 如果采用 coremail 单地址模式且填写了 coremail_server，则优先将其作为 IMAP 与 SMTP 主机
+        raw_imap = coremail_srv if (self.protocol_mode == "coremail" and coremail_srv) else config.get("imap_host", "").strip()
+        raw_smtp = coremail_srv if (self.protocol_mode == "coremail" and coremail_srv) else config.get("smtp_host", "").strip()
+
+        default_imap_port = int(config.get("imap_port", 993) or 993)
+        default_smtp_port = int(config.get("smtp_port", 465) or 465)
+
+        self.imap_host, self.imap_port = normalize_host_and_port(raw_imap, default_imap_port)
+        self.smtp_host, self.smtp_port = normalize_host_and_port(raw_smtp, default_smtp_port)
+
+        self.imap_ssl = str(config.get("imap_ssl", "1")).lower() in ("1", "true", "yes")
         self.smtp_ssl = str(config.get("smtp_ssl", "1")).lower() in ("1", "true", "yes")
 
         self.email_account = config.get("email_account", "").strip()
@@ -89,18 +194,44 @@ class CoremailClient:
         os.makedirs(self.attachment_root, exist_ok=True)
 
     def _connect_imap(self) -> imaplib.IMAP4:
-        """建立并登录 IMAP 连接"""
-        if self.imap_ssl:
-            conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, timeout=15)
-        else:
-            conn = imaplib.IMAP4(self.imap_host, self.imap_port, timeout=15)
-        conn.login(self.email_account, self.email_password)
-        return conn
+        """建立并登录 IMAP 连接（带清洗与自动降级回退）"""
+        clean_host, _ = normalize_host_and_port(self.imap_host, self.imap_port)
+        if not clean_host:
+            raise ValueError("IMAP 服务器主机名为空")
+
+        try:
+            if self.imap_ssl:
+                conn = imaplib.IMAP4_SSL(clean_host, self.imap_port, timeout=15)
+            else:
+                conn = imaplib.IMAP4(clean_host, self.imap_port, timeout=15)
+            conn.login(self.email_account, self.email_password)
+            return conn
+        except (socket.gaierror, Exception) as primary_err:
+            if isinstance(primary_err, socket.gaierror):
+                err_code = getattr(primary_err, 'errno', 11001)
+                raise socket.gaierror(
+                    err_code,
+                    f"无法解析服务器域名 '{clean_host}' (Errno {err_code})，请检查地址拼写或直接填写内网 IP 地址"
+                ) from primary_err
+
+            # 在 coremail 模式下若 993 SSL 失败，自动尝试回退降级到 143 明文端口
+            if self.protocol_mode == "coremail" and self.imap_ssl:
+                try:
+                    conn = imaplib.IMAP4(clean_host, 143, timeout=10)
+                    conn.login(self.email_account, self.email_password)
+                    self.imap_port = 143
+                    self.imap_ssl = False
+                    return conn
+                except Exception:
+                    pass
+            raise primary_err
 
     def test_connection(self) -> Dict[str, Any]:
-        """测试 IMAP 和 SMTP 连接与凭据有效性"""
+        """测试 IMAP 和 SMTP 连接与凭据有效性（友好的中文报错与降级保护）"""
         if not self.email_account or not self.email_password:
             return {"ok": False, "msg": "邮箱账号或密码未填写"}
+        if not self.imap_host and not self.smtp_host:
+            return {"ok": False, "msg": "服务器地址未填写"}
 
         try:
             # 1. 测试 IMAP 连接
@@ -109,16 +240,50 @@ class CoremailClient:
             imap_conn.logout()
 
             # 2. 测试 SMTP 连接
-            if self.smtp_ssl:
-                smtp_conn = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=15)
-            else:
-                smtp_conn = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=15)
-                smtp_conn.ehlo()
-            smtp_conn.login(self.email_account, self.email_password)
-            smtp_conn.quit()
-            return {"ok": True, "msg": "Coremail 论客 IMAP/SMTP 服务器连接验证成功"}
+            clean_smtp, _ = normalize_host_and_port(self.smtp_host, self.smtp_port)
+            smtp_conn = None
+            try:
+                if self.smtp_ssl:
+                    smtp_conn = smtplib.SMTP_SSL(clean_smtp, self.smtp_port, timeout=15)
+                else:
+                    smtp_conn = smtplib.SMTP(clean_smtp, self.smtp_port, timeout=15)
+                    smtp_conn.ehlo()
+                smtp_conn.login(self.email_account, self.email_password)
+            except Exception as smtp_err:
+                # 在 coremail 模式下尝试回退到 25 端口
+                if self.protocol_mode == "coremail" and self.smtp_ssl:
+                    try:
+                        smtp_conn = smtplib.SMTP(clean_smtp, 25, timeout=10)
+                        smtp_conn.ehlo()
+                        smtp_conn.login(self.email_account, self.email_password)
+                        self.smtp_port = 25
+                        self.smtp_ssl = False
+                    except Exception:
+                        raise smtp_err
+                else:
+                    raise smtp_err
+            finally:
+                if smtp_conn:
+                    try:
+                        smtp_conn.quit()
+                    except Exception:
+                        pass
+
+            return {"ok": True, "msg": "Coremail 论客服务器连接验证成功！收发服务均正常。"}
+        except socket.gaierror as e:
+            err_code = getattr(e, 'errno', 11001)
+            return {
+                "ok": False,
+                "msg": f"解析服务器地址失败 (Errno {err_code})：当前网络无法解析该域名，请检查拼写或直接输入论客服务器的内网 IP 地址。"
+            }
         except Exception as e:
-            return {"ok": False, "msg": f"连接失败: {str(e)}"}
+            err_str = str(e)
+            if "11001" in err_str:
+                return {
+                    "ok": False,
+                    "msg": "连接失败 (Errno 11001)：主机名无法解析，请检查服务器地址是否包含 http:// 或多余字符，建议直接填写 IP 地址。"
+                }
+            return {"ok": False, "msg": f"连接失败: {err_str}"}
 
     def fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
         """从收件箱拉取尚未入库的邮件列表"""
@@ -352,20 +517,35 @@ class CoremailClient:
         raw_message = msg.as_bytes()
 
         # SMTP 发送
-        if self.smtp_ssl:
-            smtp = smtplib.SMTP_SSL(self.smtp_host, self.smtp_port, timeout=20)
-        else:
-            smtp = smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=20)
-            smtp.ehlo()
-
+        clean_smtp, _ = normalize_host_and_port(self.smtp_host, self.smtp_port)
+        smtp = None
         try:
+            if self.smtp_ssl:
+                smtp = smtplib.SMTP_SSL(clean_smtp, self.smtp_port, timeout=20)
+            else:
+                smtp = smtplib.SMTP(clean_smtp, self.smtp_port, timeout=20)
+                smtp.ehlo()
             smtp.login(self.email_account, self.email_password)
             smtp.sendmail(self.email_account, all_recipients, raw_message)
+        except Exception as primary_smtp_err:
+            if self.protocol_mode == "coremail" and self.smtp_ssl:
+                try:
+                    smtp = smtplib.SMTP(clean_smtp, 25, timeout=15)
+                    smtp.ehlo()
+                    smtp.login(self.email_account, self.email_password)
+                    smtp.sendmail(self.email_account, all_recipients, raw_message)
+                    self.smtp_port = 25
+                    self.smtp_ssl = False
+                except Exception:
+                    raise primary_smtp_err
+            else:
+                raise primary_smtp_err
         finally:
-            try:
-                smtp.quit()
-            except Exception:
-                pass
+            if smtp:
+                try:
+                    smtp.quit()
+                except Exception:
+                    pass
 
         # 写入已发送文件夹
         if save_to_sent:

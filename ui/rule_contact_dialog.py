@@ -262,7 +262,7 @@ class RuleAndContactDialog(QDialog):
         layout = QVBoxLayout(parent)
         self.rules_table = QTableWidget(0, 8)
         self.rules_table.setHorizontalHeaderLabels([
-            "ID", "规则名称", "匹配范围", "关键词列表", "排除词", "默认收件人 (F)", "默认流转模式", "优先级"
+            "ID", "规则名称", "匹配范围", "关键词列表", "排除词", "默认流转收件人", "默认流转模式", "优先级"
         ])
         self.rules_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)

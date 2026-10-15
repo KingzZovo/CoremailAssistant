@@ -50,9 +50,9 @@ class ComposeAndSendDialog(QDialog):
         mode_box.addWidget(QLabel("<b>流转模式：</b>"))
 
         self.mode_btn_group = QButtonGroup(self)
-        self.btn_mode_rewrite = QPushButton("✨ 改写为新邮件发给 F (rewrite_new)")
+        self.btn_mode_rewrite = QPushButton("✨ 改写为新邮件（脱壳改称呼与主语）")
         self.btn_mode_rewrite.setCheckable(True)
-        self.btn_mode_forward = QPushButton("↪️ 标准带引文转发 (standard_forward)")
+        self.btn_mode_forward = QPushButton("↪️ 标准带引文转发")
         self.btn_mode_forward.setCheckable(True)
 
         self.mode_btn_group.addButton(self.btn_mode_rewrite, 1)
@@ -65,7 +65,7 @@ class ComposeAndSendDialog(QDialog):
         main_layout.addLayout(mode_box)
 
         # 2. 收件人与常用联系人快捷点选池
-        to_group = QGroupBox("收件人 (F) 与常用联系人点选池")
+        to_group = QGroupBox("常用收件人快捷勾选（点击自动联动称呼与抄送栏）：")
         to_layout = QVBoxLayout(to_group)
         to_layout.setContentsMargins(10, 10, 10, 10)
         to_layout.setSpacing(6)
@@ -109,7 +109,9 @@ class ComposeAndSendDialog(QDialog):
         self.cc_edit.setPlaceholderText("自动聚合原发件人、原收件人与原抄送人")
         cc_box.addWidget(self.cc_edit, 1)
 
-        self.chk_include_sender = QCheckBox(f"抄送原发件人 A ({self.email_data.get('sender_name') or self.email_data.get('sender_email')})")
+        sender_disp = self.email_data.get('sender_name') or self.email_data.get('sender_email') or ""
+        lbl_sender_cc = f"抄送原发件人（{sender_disp}）" if sender_disp else "抄送原发件人"
+        self.chk_include_sender = QCheckBox(lbl_sender_cc)
         self.chk_include_sender.setChecked(self.settings.get("default_include_sender_in_cc", "1") == "1")
         self.chk_include_sender.stateChanged.connect(self._recompute_recipients)
         cc_box.addWidget(self.chk_include_sender)
@@ -357,7 +359,7 @@ class ComposeAndSendDialog(QDialog):
     def _confirm_and_send(self):
         to_addrs = self._get_selected_f_emails()
         if not to_addrs:
-            QMessageBox.warning(self, "发信校验", "请至少指定一位收件人 F")
+            QMessageBox.warning(self, "发信校验", "请至少指定一位收件人")
             return
 
         cc_raw = self.cc_edit.text()

@@ -22,6 +22,10 @@ LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 # 默认系统配置项字典（用于数据库首次初始化或配置回退）
 DEFAULT_SETTINGS = {
+    # 论客邮箱 (Coremail) 协议与统一服务器配置 (适配论客客户端专用协议与单地址模式)
+    "protocol_mode": "coremail",         # 'coremail': 专用单地址协议 (同论客客户端), 'imap_smtp': 标准手动端口
+    "coremail_server": "",               # Coremail 统一服务器地址 (IP或域名)
+
     # 论客邮箱 (Coremail) IMAP 收信服务
     "imap_host": "mail.example.com",
     "imap_port": "993",
@@ -57,5 +61,5 @@ DEFAULT_SETTINGS = {
     "ollama_timeout": "30",
 
     # 默认发信抄送习惯
-    "default_include_sender_in_cc": "1", # 1: 默认抄送原发件人 A, 0: 不抄送
+    "default_include_sender_in_cc": "1", # 1: 默认抄送原发件人, 0: 不抄送
 }

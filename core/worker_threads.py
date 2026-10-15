@@ -33,7 +33,8 @@ class MailSyncWorker(QThread):
                 self.sync_failed.emit("未配置论客邮箱账号或密码，请先在系统设置中保存配置")
                 return
 
-            self.progress_msg.emit(f"正在连接论客邮箱服务器: {settings.get('imap_host')}...")
+            server_disp = settings.get("coremail_server") or settings.get("imap_host") or "论客服务器"
+            self.progress_msg.emit(f"正在连接论客邮箱服务器: {server_disp}...")
             client = CoremailClient(settings)
 
             existing_uids = self.db.get_existing_uids()

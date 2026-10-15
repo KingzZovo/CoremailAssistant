@@ -217,13 +217,13 @@ class MainWindow(QMainWindow):
         act_layout = QHBoxLayout(self.mail_actions_group)
         act_layout.setContentsMargins(10, 10, 10, 10)
 
-        self.btn_rewrite_new = QPushButton("✨ 改写为新邮件发给 F")
+        self.btn_rewrite_new = QPushButton("✨ 改写为新邮件发送")
         self.btn_rewrite_new.setObjectName("btn_primary")
         self.btn_rewrite_new.setProperty("primary", True)
         self.btn_rewrite_new.clicked.connect(lambda: self._open_compose_dialog("rewrite_new"))
         act_layout.addWidget(self.btn_rewrite_new)
 
-        self.btn_forward = QPushButton("↪️ 标准带引文转发给 F")
+        self.btn_forward = QPushButton("↪️ 标准带引文转发")
         self.btn_forward.clicked.connect(lambda: self._open_compose_dialog("standard_forward"))
         act_layout.addWidget(self.btn_forward)
 
@@ -421,7 +421,7 @@ class MainWindow(QMainWindow):
         <b>发送时间：</b>{em.get('date_str')}<br>
         <b>原收件人：</b>{to_names}<br>
         <b>原抄送人：</b>{cc_names or '无'}<br>
-        <b>推荐收件人 (F)：</b><span style="color:#2563EB; font-weight:600;">{rec_f}</span> |
+        <b>推荐收件人：</b><span style="color:#2563EB; font-weight:600;">{rec_f}</span> |
         <b>推荐模式：</b>{'✨ 改写为新邮件' if em.get('recommended_mode') == 'rewrite_new' else '↪️ 标准带引文转发'}
         """
 
@@ -439,6 +439,22 @@ class MainWindow(QMainWindow):
             self.detail_body_view.setHtml(em.get("body_html"))
         else:
             self.detail_body_view.setPlainText(em.get("body_text", ""))
+
+        # 动态更新“改写为新邮件”按钮文字为推荐收件人姓名或邮箱
+        suggested = em.get("suggested_to", [])
+        if suggested:
+            target_disp = suggested[0]
+            try:
+                contacts = self.db.get_all_contacts()
+                for c in contacts:
+                    if c.get("email", "").lower() == target_disp.lower() and c.get("name"):
+                        target_disp = c["name"]
+                        break
+            except Exception:
+                pass
+            self.btn_rewrite_new.setText(f"✨ 改写为新邮件（推荐发给：{target_disp}）")
+        else:
+            self.btn_rewrite_new.setText("✨ 改写为新邮件发送")
 
     def _display_memo_detail(self, m: Dict[str, Any]):
         chk_lines = []
@@ -459,6 +475,7 @@ class MainWindow(QMainWindow):
     def _clear_detail(self):
         self.detail_header_lbl.setText("请在左侧列表中选择一项以查看详细内容")
         self.detail_body_view.clear()
+        self.btn_rewrite_new.setText("✨ 改写为新邮件发送")
 
     # =========================================================================
     # 同步与流转业务动作

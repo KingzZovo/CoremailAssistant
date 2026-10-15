@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.database import DatabaseManager
-from core.mail_client import CoremailClient
+from core.mail_client import CoremailClient, probe_coremail_server_ports
 from core.ml_learner import LocalEmailLearner
 from core.ollama_client import OllamaClient
 
@@ -45,14 +45,48 @@ class SettingsDialog(QDialog):
         layout.setSpacing(12)
 
         # 1. 邮箱服务器与账号凭证
-        mail_group = QGroupBox("论客邮箱 (Coremail) 服务器与账号设置")
+        mail_group = QGroupBox("论客邮箱 (Coremail) 协议与服务器设置")
         mail_layout = QVBoxLayout(mail_group)
+
+        # 协议类型选择
+        proto_row = QHBoxLayout()
+        proto_row.addWidget(QLabel("协议类型："))
+        self.protocol_mode = QComboBox()
+        self.protocol_mode.addItem("Coremail 专用协议（同论客客户端，仅需填一个服务器地址）", "coremail")
+        self.protocol_mode.addItem("IMAP / SMTP 标准协议（手动分别指定端口）", "imap_smtp")
+        self.protocol_mode.currentIndexChanged.connect(self._on_protocol_mode_changed)
+        proto_row.addWidget(self.protocol_mode, 1)
+        mail_layout.addLayout(proto_row)
+
+        # Coremail 专用协议：单服务器地址输入与自动探测区域
+        self.coremail_box = QWidget()
+        coremail_layout = QVBoxLayout(self.coremail_box)
+        coremail_layout.setContentsMargins(0, 4, 0, 4)
+        c_row = QHBoxLayout()
+        c_row.addWidget(QLabel("服务器地址："))
+        self.coremail_server = QLineEdit()
+        self.coremail_server.setPlaceholderText("例如 192.168.1.50 或 mail.company.com（与论客客户端一致）")
+        c_row.addWidget(self.coremail_server, 2)
+        self.btn_detect_server = QPushButton("🔍 自动检测端口与连接")
+        self.btn_detect_server.clicked.connect(self._detect_coremail_ports)
+        c_row.addWidget(self.btn_detect_server)
+        coremail_layout.addLayout(c_row)
+
+        self.coremail_tip_lbl = QLabel("💡 提示：与论客客户端一致，可直接粘贴客户端【设置->帐号管理】里的服务器 IP 或域名。点击“自动检测”将自动探测内网端口并测试连接。")
+        self.coremail_tip_lbl.setStyleSheet("color: #64748B; font-size: 11px;")
+        coremail_layout.addWidget(self.coremail_tip_lbl)
+        mail_layout.addWidget(self.coremail_box)
+
+        # IMAP/SMTP 标准协议：手动输入区域
+        self.manual_server_box = QWidget()
+        manual_layout = QVBoxLayout(self.manual_server_box)
+        manual_layout.setContentsMargins(0, 4, 0, 4)
 
         # IMAP
         imap_row = QHBoxLayout()
         imap_row.addWidget(QLabel("IMAP 主机："))
         self.imap_host = QLineEdit()
-        self.imap_host.setPlaceholderText("例如 mail.company.com")
+        self.imap_host.setPlaceholderText("例如 mail.company.com 或 IP")
         imap_row.addWidget(self.imap_host, 2)
         imap_row.addWidget(QLabel("端口："))
         self.imap_port = QSpinBox()
@@ -62,13 +96,13 @@ class SettingsDialog(QDialog):
         self.imap_ssl = QCheckBox("SSL 加密")
         self.imap_ssl.setChecked(True)
         imap_row.addWidget(self.imap_ssl)
-        mail_layout.addLayout(imap_row)
+        manual_layout.addLayout(imap_row)
 
         # SMTP
         smtp_row = QHBoxLayout()
         smtp_row.addWidget(QLabel("SMTP 主机："))
         self.smtp_host = QLineEdit()
-        self.smtp_host.setPlaceholderText("例如 mail.company.com")
+        self.smtp_host.setPlaceholderText("例如 mail.company.com 或 IP")
         smtp_row.addWidget(self.smtp_host, 2)
         smtp_row.addWidget(QLabel("端口："))
         self.smtp_port = QSpinBox()
@@ -78,7 +112,9 @@ class SettingsDialog(QDialog):
         self.smtp_ssl = QCheckBox("SSL 加密")
         self.smtp_ssl.setChecked(True)
         smtp_row.addWidget(self.smtp_ssl)
-        mail_layout.addLayout(smtp_row)
+        manual_layout.addLayout(smtp_row)
+
+        mail_layout.addWidget(self.manual_server_box)
 
         # 账号凭据
         acc_row = QHBoxLayout()
@@ -99,7 +135,7 @@ class SettingsDialog(QDialog):
         self.sender_display_name.setPlaceholderText("例如 张三 (发信时在收件方显示的中文名)")
         disp_row.addWidget(self.sender_display_name, 1)
 
-        btn_test = QPushButton("🔌 测试连接 (IMAP/SMTP)")
+        btn_test = QPushButton("🔌 测试连接")
         btn_test.clicked.connect(self._test_connection)
         disp_row.addWidget(btn_test)
         mail_layout.addLayout(disp_row)
@@ -130,7 +166,7 @@ class SettingsDialog(QDialog):
         behav_row = QHBoxLayout()
         self.chk_auto_read = QCheckBox("邮件流转成功后自动标记为已读")
         behav_row.addWidget(self.chk_auto_read)
-        self.chk_cc_sender = QCheckBox("默认勾选抄送原发件人 A")
+        self.chk_cc_sender = QCheckBox("默认勾选抄送原发件人")
         behav_row.addWidget(self.chk_cc_sender)
         behav_row.addStretch()
         auto_layout.addLayout(behav_row)
@@ -203,6 +239,50 @@ class SettingsDialog(QDialog):
 
         main_layout.addLayout(bottom_bar)
 
+    def _on_protocol_mode_changed(self):
+        mode = self.protocol_mode.currentData()
+        if mode == "coremail":
+            self.coremail_box.setVisible(True)
+            self.manual_server_box.setVisible(False)
+        else:
+            self.coremail_box.setVisible(False)
+            self.manual_server_box.setVisible(True)
+
+    def _detect_coremail_ports(self):
+        server = self.coremail_server.text().strip()
+        if not server:
+            QMessageBox.warning(self, "提示", "请先输入论客服务器地址（IP 或域名）")
+            return
+
+        res = probe_coremail_server_ports(server)
+        if not res.get("ok"):
+            QMessageBox.critical(self, "检测失败", res.get("msg", "无法连接到该服务器"))
+            return
+
+        clean_host = res.get("host", server)
+        imap_p = res.get("imap_port", 993)
+        imap_s = res.get("imap_ssl", True)
+        smtp_p = res.get("smtp_port", 465)
+        smtp_s = res.get("smtp_ssl", True)
+
+        self.imap_host.setText(clean_host)
+        self.imap_port.setValue(imap_p)
+        self.imap_ssl.setChecked(imap_s)
+
+        self.smtp_host.setText(clean_host)
+        self.smtp_port.setValue(smtp_p)
+        self.smtp_ssl.setChecked(smtp_s)
+
+        msg = (
+            f"🎉 论客服务器端口检测成功！\n\n"
+            f"• 服务器主机: {clean_host}\n"
+            f"• 解析 IP: {res.get('resolved_ip')}\n"
+            f"• IMAP 收信端口: {imap_p} (SSL 加密: {'开启' if imap_s else '关闭'})\n"
+            f"• SMTP 发信端口: {smtp_p} (SSL 加密: {'开启' if smtp_s else '关闭'})\n\n"
+            f"已自动为您填入对应配置。您可以点击下方的“测试连接”验证邮箱账号密码。"
+        )
+        QMessageBox.information(self, "检测成功", msg)
+
     def _refresh_ml_status(self):
         sample_count = self.db.get_sample_count()
         diff_count = self.db.get_learned_diff_rules_count()
@@ -226,7 +306,16 @@ class SettingsDialog(QDialog):
             QMessageBox.information(self, "重置完成", "本地机器学习模型已重置为初始状态")
 
     def _test_connection(self):
+        proto_mode = self.protocol_mode.currentData()
+        c_srv = self.coremail_server.text().strip()
+
+        if proto_mode == "coremail" and not c_srv:
+            QMessageBox.warning(self, "提示", "请填写论客服务器地址")
+            return
+
         cfg = {
+            "protocol_mode": proto_mode,
+            "coremail_server": c_srv,
             "imap_host": self.imap_host.text().strip(),
             "imap_port": self.imap_port.value(),
             "imap_ssl": self.imap_ssl.isChecked(),
@@ -239,6 +328,10 @@ class SettingsDialog(QDialog):
         client = CoremailClient(cfg)
         res = client.test_connection()
         if res.get("ok"):
+            self.imap_port.setValue(client.imap_port)
+            self.imap_ssl.setChecked(client.imap_ssl)
+            self.smtp_port.setValue(client.smtp_port)
+            self.smtp_ssl.setChecked(client.smtp_ssl)
             QMessageBox.information(self, "连接成功", res.get("msg"))
         else:
             QMessageBox.critical(self, "连接失败", res.get("msg"))
@@ -257,6 +350,14 @@ class SettingsDialog(QDialog):
 
     def _load_settings(self):
         st = self.db.get_all_settings()
+
+        proto_mode = st.get("protocol_mode", "coremail")
+        idx_p = self.protocol_mode.findData(proto_mode)
+        if idx_p >= 0:
+            self.protocol_mode.setCurrentIndex(idx_p)
+        self.coremail_server.setText(st.get("coremail_server", ""))
+        self._on_protocol_mode_changed()
+
         self.imap_host.setText(st.get("imap_host", ""))
         self.imap_port.setValue(int(st.get("imap_port", 993) or 993))
         self.imap_ssl.setChecked(st.get("imap_ssl", "1") == "1")
@@ -283,11 +384,24 @@ class SettingsDialog(QDialog):
         self.ollama_model.setText(st.get("ollama_model", "qwen2.5:3b"))
 
     def _save_settings(self):
+        proto_mode = self.protocol_mode.currentData()
+        c_srv = self.coremail_server.text().strip()
+
+        imap_h = self.imap_host.text().strip()
+        smtp_h = self.smtp_host.text().strip()
+        if proto_mode == "coremail" and c_srv:
+            if not imap_h:
+                imap_h = c_srv
+            if not smtp_h:
+                smtp_h = c_srv
+
         data = {
-            "imap_host": self.imap_host.text().strip(),
+            "protocol_mode": proto_mode,
+            "coremail_server": c_srv,
+            "imap_host": imap_h,
             "imap_port": str(self.imap_port.value()),
             "imap_ssl": "1" if self.imap_ssl.isChecked() else "0",
-            "smtp_host": self.smtp_host.text().strip(),
+            "smtp_host": smtp_h,
             "smtp_port": str(self.smtp_port.value()),
             "smtp_ssl": "1" if self.smtp_ssl.isChecked() else "0",
             "email_account": self.email_account.text().strip(),
