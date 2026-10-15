@@ -209,7 +209,7 @@ class DatabaseManager:
     # 1. 系统配置管理 (Settings CRUD)
     # =========================================================================
 
-    def get_setting(self, key: str, default: Optional[str] = None) -> str:
+    def get_setting(self, key: str, default: Any = None) -> Any:
         """获取单个系统配置项"""
         with self._op_lock, self.get_connection() as conn:
             cursor = conn.cursor()
@@ -219,18 +219,21 @@ class DatabaseManager:
                 return row["value"]
             return default if default is not None else DEFAULT_SETTINGS.get(key, "")
 
-    def set_setting(self, key: str, value: Any) -> None:
+    def save_setting(self, key: str, value: Any) -> None:
         """写入或更新单个系统配置项"""
+        val_str = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
         with self._op_lock, self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-                (key, str(value)),
+                (key, val_str),
             )
             conn.commit()
 
-    def get_all_settings(self) -> Dict[str, str]:
-        """获取所有系统配置构成的字典"""
+    set_setting = save_setting
+
+    def get_all_settings(self) -> Dict[str, Any]:
+        """获取所有系统配置构成的字典（含默认配置回退）"""
         with self._op_lock, self.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT key, value FROM settings;")
@@ -239,16 +242,21 @@ class DatabaseManager:
                 result[row["key"]] = row["value"]
             return result
 
-    def update_settings(self, settings_dict: Dict[str, Any]) -> None:
-        """批量更新配置项"""
+    get_settings = get_all_settings
+
+    def save_settings(self, settings_dict: Dict[str, Any]) -> None:
+        """批量保存更新系统配置"""
         with self._op_lock, self.get_connection() as conn:
             cursor = conn.cursor()
             for k, v in settings_dict.items():
+                val_str = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
                 cursor.execute(
                     "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value;",
-                    (k, str(v)),
+                    (k, val_str),
                 )
             conn.commit()
+
+    update_settings = save_settings
 
     # =========================================================================
     # 2. 邮件数据管理 (Emails CRUD)
@@ -719,10 +727,17 @@ class DatabaseManager:
         use_salutation: Optional[int] = None,
         preferred_salutation: Optional[str] = None,
         preferred_mode: Optional[str] = None,
+        salutation: Optional[str] = None,
+        mode: Optional[str] = None,
     ) -> None:
         """由机器学习或发信拦截器自动学习更新对联系人 F 的发信习惯"""
         if not email:
             return
+        if salutation is not None and preferred_salutation is None:
+            preferred_salutation = salutation
+        if mode is not None and preferred_mode is None:
+            preferred_mode = mode
+
         updates = []
         params = []
         if use_salutation is not None:
@@ -749,19 +764,32 @@ class DatabaseManager:
     # 5. 全文主语/句式改写词典管理 (Fulltext Rewrite Rules CRUD)
     # =========================================================================
 
-    def get_all_rewrite_rules(self, enabled_only: bool = False) -> List[Dict[str, Any]]:
-        """获取所有全文改写规则，按命中使用次数降序排列"""
+    def get_all_rewrite_rules(
+        self,
+        enabled_only: bool = False,
+        sender_email: str = "",
+        target_email: str = "",
+    ) -> List[Dict[str, Any]]:
+        """获取所有全文改写规则，支持启用状态与发件人/收件人范围过滤，按命中使用次数降序排列"""
         with self._op_lock, self.get_connection() as conn:
             cursor = conn.cursor()
+            clauses = []
+            params: List[Any] = []
             if enabled_only:
-                cursor.execute(
-                    "SELECT * FROM fulltext_rewrite_rules WHERE is_enabled = 1 ORDER BY hit_count DESC, id ASC;"
-                )
-            else:
-                cursor.execute(
-                    "SELECT * FROM fulltext_rewrite_rules ORDER BY hit_count DESC, id ASC;"
-                )
+                clauses.append("is_enabled = 1")
+            if sender_email:
+                clauses.append("(sender_filter = '' OR LOWER(sender_filter) = LOWER(?))")
+                params.append(sender_email.strip())
+            if target_email:
+                clauses.append("(target_filter = '' OR LOWER(target_filter) = LOWER(?))")
+                params.append(target_email.strip())
+            where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            sql = f"SELECT * FROM fulltext_rewrite_rules {where_sql} ORDER BY hit_count DESC, id ASC;"
+            cursor.execute(sql, params)
             return [dict(r) for r in cursor.fetchall()]
+
+    get_active_rewrite_rules = get_all_rewrite_rules
+    list_rewrite_rules = get_all_rewrite_rules
 
     def add_rewrite_rule(
         self,
@@ -831,10 +859,11 @@ class DatabaseManager:
 
     def upsert_learned_rewrite_rule(
         self,
-        sender_filter: str,
-        target_filter: str,
-        source_pattern: str,
-        target_template: str,
+        sender_filter: str = "",
+        target_filter: str = "",
+        source_pattern: str = "",
+        target_template: str = "",
+        is_regex: int = 0,
     ) -> Tuple[int, bool]:
         """
         核心方法：由机器学习 Diff 对比器在用户编辑发出后调用。
@@ -880,9 +909,9 @@ class DatabaseManager:
                     INSERT INTO fulltext_rewrite_rules (
                         sender_filter, target_filter, source_pattern, target_template,
                         is_regex, learned_from_diff, hit_count, is_enabled
-                    ) VALUES (?, ?, ?, ?, 0, 1, 1, 1);
+                    ) VALUES (?, ?, ?, ?, ?, 1, 1, 1);
                     """,
-                    (s_filter, t_filter, clean_src, clean_tgt),
+                    (s_filter, t_filter, clean_src, clean_tgt, int(is_regex)),
                 )
                 conn.commit()
                 return cursor.lastrowid, True
@@ -1052,3 +1081,30 @@ class DatabaseManager:
             cursor.execute("DELETE FROM match_rules WHERE id = ?;", (rule_id,))
             conn.commit()
             return cursor.rowcount > 0
+
+    # =========================================================================
+    # 8. 跨模块调用兼容别名 (Cross-module Compatibility Aliases)
+    # =========================================================================
+
+    # 联系人相关别名
+    get_contacts = get_all_contacts
+    list_contacts = get_all_contacts
+    upsert_contact = add_contact
+
+    # 匹配规则相关别名
+    get_rules = get_all_match_rules
+    list_rules = get_all_match_rules
+
+    # 邮件存取相关别名
+    save_email = insert_email
+    get_emails = get_all_emails
+    list_emails = get_all_emails
+    get_matched_emails = get_pending_emails
+
+    # 备忘录相关别名
+    add_memo = create_memo
+    save_memo = create_memo
+    create_or_update_memo = create_memo
+    get_all_memos = get_memos
+    list_memos = get_memos
+

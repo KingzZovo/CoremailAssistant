@@ -56,8 +56,14 @@ class LocalEmailLearner:
         cc_tags = " ".join([f"__cc_{c.get('email', '').lower().strip()}__" for c in (cc_list or [])])
         return f"{sender_tag} {sender_tag} {cc_tags} {subject} {subject} {full_body or ''}"
 
-    def predict_email(self, email_data: Dict[str, Any], candidate_contacts: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def predict_email(
+        self,
+        email_data: Dict[str, Any],
+        candidate_contacts: Optional[List[Dict[str, Any]]] = None
+    ) -> Dict[str, Any]:
         """基于邮件全文预测：是否需流转、推荐新建还是转发、推荐收件人 F"""
+        if candidate_contacts is None:
+            candidate_contacts = []
         sender = (email_data.get("sender_email") or "").lower().strip()
         cc_list = email_data.get("cc_list") or []
         subject = email_data.get("subject") or ""
@@ -188,6 +194,11 @@ class LocalEmailLearner:
                                         learned_pairs.append((src_piece, tgt_piece))
 
         return learned_pairs
+
+    # 兼容别名
+    predict = predict_email
+    learn_from_sent_email = learn_from_user_action
+    learn_rewrite_rule_from_diff = extract_fulltext_rewrite_diffs
 
     def reset_models(self) -> None:
         """重置本地机器学习模型"""

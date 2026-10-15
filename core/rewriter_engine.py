@@ -227,6 +227,8 @@ class RewriterEngine:
 
         return new_to, new_cc
 
+    calculate_recipients_and_cc = compute_recipients
+
     @classmethod
     def build_compose_content(
         cls,
@@ -312,3 +314,13 @@ class RewriterEngine:
                 "plain_body": plain_body,
                 "html_body": html_body
             }
+
+
+EmailRewriterEngine = RewriterEngine
+
+__all__ = [
+    "RewriterEngine",
+    "EmailRewriterEngine",
+    "STRICT_SALUTATION_REGEX",
+    "DEFAULT_FULLTEXT_REWRITES",
+]

@@ -39,12 +39,20 @@ if not exist ".venv" (
 
 :: 激活虚拟环境并安装依赖
 echo.
-echo [3/4] 正在安装与升级依赖项...
+echo [3/4] 正在安装与配置依赖项...
 call .venv\Scripts\activate.bat
-python -m pip install --upgrade pip
-pip install -r requirements.txt
-if %errorlevel% neq 0 (
-    echo [警告] 依赖安装过程中出现提示，建议检查网络或使用国内镜像源（如清华源）。
+
+if exist "wheels" (
+    echo [提示] 检测到本地 wheels 离线依赖目录，正在执行离线安装（纯内网免下载模式）...
+    pip install --no-index --find-links=wheels -r requirements.txt
+) else (
+    echo [提示] 正在使用国内镜像加速下载依赖...
+    python -m pip install --upgrade pip -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn >nul 2>&1
+    pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple --trusted-host pypi.tuna.tsinghua.edu.cn
+    if %errorlevel% neq 0 (
+        echo [提示] 尝试通过官方默认源重试安装...
+        pip install -r requirements.txt
+    )
 )
 
 :: 初始化配置文件
