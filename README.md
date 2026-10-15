@@ -79,10 +79,12 @@ CoremailAssistant/
 前往 GitHub 官方 Releases 页面直接下载已打包版本：
 👉 **[下载最新发布版本 (Releases)](https://github.com/KingzZovo/CoremailAssistant/releases)**
 
-| 下载文件 | 说明 | 适用场景 |
-| :--- | :--- | :--- |
-| **`CoremailAssistant-v1.0.0-Windows-x64.zip`** | 包含编译打包后的独立可执行文件（`.exe`），**无需安装 Python**，解压后双击即用 | 生产环境 / 普通 Windows 用户 |
-| **`CoremailAssistant-v1.0.0-Portable.zip`** | 便携源码整合包，内含 Windows 一键安装与启动脚本（`一键安装并启动.bat`） | 开发者 / 需要自定义规则与调试的用户 |
+| 下载文件 | 文件大小 | 说明与特性 | 适用场景 |
+| :--- | :--- | :--- | :--- |
+| **`CoremailAssistant-Setup-vX.X.X.exe`** | **~35MB - 50MB** | **【强烈推荐】单文件安装向导**：基于 Inno Setup 固实 LZMA2 极限压缩，体积相比普通 Zip 直降 85%+；一键安装，自动创建桌面与开始菜单快捷方式，无需管理员 UAC 权限，升级时自动关闭旧版本保护数据 | 绝大多数 Windows 最终用户 |
+| **`CoremailAssistant-vX.X.X-Portable.7z`** | **~35MB - 55MB** | **绿色便携版 (7-Zip 固实极高压缩)**：免安装，解压到任意目录双击即可运行，体积超小 | 偏好纯绿色软件、存放在 U盘/移动硬盘的用户 |
+| **`CoremailAssistant-vX.X.X-Windows-x64.zip`** | **~60MB - 90MB** | **通用 Zip 便携版 (7-Zip 优化压缩)**：无需安装任何解压软件，Windows 系统原生右键解压即用 | 无法运行 7z 或受公司软件安装限制的环境 |
+| **`CoremailAssistant-vX.X.X-Portable.zip`** | **~120KB** | **纯源码便携包**：内含 Windows 一键安装与启动脚本（`一键安装并启动.bat`，支持清华源与内网 wheels 离线安装） | 开发者 / 需要二次开发或调试的用户 |
 
 ---
 

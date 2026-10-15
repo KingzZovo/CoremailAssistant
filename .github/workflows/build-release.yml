@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   build-windows:
-    name: Build Standalone Windows x64 Application
+    name: Build Standalone Windows x64 Application & Installer
     runs-on: windows-latest
 
     steps:
@@ -24,51 +24,91 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Build Dependencies
+      - name: Install Build Dependencies & Inno Setup
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyinstaller
+          choco install innosetup --no-progress
 
-      - name: Build Windows Application with PyInstaller
+      - name: Build Windows Application with PyInstaller (Optimized Spec)
         run: |
-          pyinstaller --noconfirm --onedir --windowed `
-            --name "CoremailAssistant" `
-            --collect-all PySide6 `
-            --collect-all jieba `
-            --collect-all sklearn `
-            --collect-all scipy `
-            --copy-metadata scikit-learn `
-            --add-data "config.py;." `
-            main.py
+          pyinstaller --noconfirm CoremailAssistant.spec
 
-      - name: Package Release Assets
+      - name: Prune Bloated Directories & Stage Assets
         shell: pwsh
         run: |
+          $distDir = "dist/CoremailAssistant"
+          
+          # Remove unused Qt plugins and bloated directories to save 200MB+
+          $prunePaths = @(
+            "$distDir/PySide6/qml",
+            "$distDir/PySide6/translations",
+            "$distDir/PySide6/plugins/designer",
+            "$distDir/PySide6/plugins/multimedia",
+            "$distDir/PySide6/plugins/position",
+            "$distDir/PySide6/plugins/sensors",
+            "$distDir/PySide6/plugins/spatialaudio",
+            "$distDir/PySide6/plugins/sqldrivers",
+            "$distDir/PySide6/plugins/tls"
+          )
+          foreach ($p in $prunePaths) {
+            if (Test-Path $p) {
+              Write-Output "Pruning: $p"
+              Remove-Item -Recurse -Force $p
+            }
+          }
+
           # Copy essential config templates and launchers
-          Copy-Item -Path "README.md" -Destination "dist/CoremailAssistant/"
-          Copy-Item -Path ".env.example" -Destination "dist/CoremailAssistant/"
+          Copy-Item -Path "README.md" -Destination "$distDir/"
+          Copy-Item -Path ".env.example" -Destination "$distDir/"
           if (Test-Path "config/config.example.yaml") {
-            New-Item -ItemType Directory -Force -Path "dist/CoremailAssistant/config"
-            Copy-Item -Path "config/config.example.yaml" -Destination "dist/CoremailAssistant/config/"
+            New-Item -ItemType Directory -Force -Path "$distDir/config"
+            Copy-Item -Path "config/config.example.yaml" -Destination "$distDir/config/"
           }
           if (Test-Path "config/rules.example.yaml") {
-            Copy-Item -Path "config/rules.example.yaml" -Destination "dist/CoremailAssistant/config/"
+            Copy-Item -Path "config/rules.example.yaml" -Destination "$distDir/config/"
           }
           
-          # Create friendly Windows launcher batch
-          Set-Content -Path "dist/CoremailAssistant/启动论客助手.bat" -Value "@echo off`r`nstart CoremailAssistant.exe" -Encoding utf8
+          # Ensure empty data folder exists
+          New-Item -ItemType Directory -Force -Path "$distDir/data" | Out-Null
           
-          # Compress to zip
-          $Tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.0" }
-          $ZipName = "CoremailAssistant-$Tag-Windows-x64.zip"
-          Compress-Archive -Path "dist/CoremailAssistant/*" -DestinationPath $ZipName -Force
-          Write-Output "ZIP_NAME=$ZipName" >> $env:GITHUB_ENV
+          # Create friendly Windows launcher batch
+          Set-Content -Path "$distDir/启动论客助手.bat" -Value "@echo off`r`nstart CoremailAssistant.exe" -Encoding utf8
+
+      - name: Build Inno Setup Installer (Ultra LZMA2)
+        shell: pwsh
+        run: |
+          $Tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.4" }
+          $VerNum = $Tag.TrimStart("v")
+          
+          Write-Output "Compiling Inno Setup Installer for version $VerNum..."
+          & "C:\Program Files (x86)\Inno Setup 6\iscc.exe" /DMyAppVersion=$VerNum installer/setup.iss
+
+      - name: Package Ultra-Compressed 7z & Zip Archives
+        shell: pwsh
+        run: |
+          $Tag = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "v1.0.4" }
+          $7z = if (Get-Command 7z -ErrorAction SilentlyContinue) { "7z" } else { "C:\Program Files\7-Zip\7z.exe" }
+
+          # 1. High compression .7z (Solid LZMA2)
+          $7zArchive = "CoremailAssistant-$Tag-Portable.7z"
+          & $7z a -t7z -mx=9 -m0=lzma2 -ms=on $7zArchive "./dist/CoremailAssistant/*"
+
+          # 2. High compression standard .zip
+          $ZipArchive = "CoremailAssistant-$Tag-Windows-x64.zip"
+          & $7z a -tzip -mx=9 $ZipArchive "./dist/CoremailAssistant/*"
+
+          Write-Output "==== Package Sizes Summary ===="
+          Get-ChildItem -Path "dist_installer/*.exe", "*.7z", "*.zip" | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
-          files: ${{ env.ZIP_NAME }}
+          files: |
+            dist_installer/CoremailAssistant-Setup-*.exe
+            CoremailAssistant-*-Portable.7z
+            CoremailAssistant-*-Windows-x64.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
