@@ -1,5 +1,5 @@
 """CoremailAssistant desktop application entrypoint.
-Initializes High-DPI scaling, SQLite database schema, Windows 11 Fluent theme, and Main Window.
+Initializes High-DPI scaling, Single-Instance lock, SQLite database schema, Windows 11 Fluent theme, and Main Window.
 """
 
 import sys
@@ -13,10 +13,13 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from PySide6.QtCore import Qt, QCoreApplication
 from PySide6.QtWidgets import QApplication
+from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 from core.database import DatabaseManager
 from ui.theme import APP_QSS
 from ui.main_window import MainWindow
+
+SINGLE_INSTANCE_SERVER_NAME = "CoremailAssistant_SingleInstance_App_Lock"
 
 
 def main():
@@ -27,12 +30,43 @@ def main():
     app = QApplication(sys.argv)
     app.setStyleSheet(APP_QSS)
 
+    # 1. 单实例检查：尝试连接已有的本地服务端
+    client_socket = QLocalSocket()
+    client_socket.connectToServer(SINGLE_INSTANCE_SERVER_NAME)
+    if client_socket.waitForConnected(500):
+        # 已有运行中的实例，向其发送唤醒信号后直接退出当前重复进程
+        client_socket.write(b"WAKEUP\n")
+        client_socket.waitForBytesWritten(500)
+        client_socket.disconnectFromServer()
+        sys.exit(0)
+
+    # 2. 当前为首个实例，建立本地服务监听后续启动唤醒
+    QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
+    server = QLocalServer()
+    if not server.listen(SINGLE_INSTANCE_SERVER_NAME):
+        # 若初次监听失败，尝试强制清除残留后再次监听
+        QLocalServer.removeServer(SINGLE_INSTANCE_SERVER_NAME)
+        server.listen(SINGLE_INSTANCE_SERVER_NAME)
+
     # 预初始化本地 SQLite 数据库与默认配置
     DatabaseManager()
 
     # 启动主窗口
     window = MainWindow()
     window.show()
+
+    def handle_incoming_connection():
+        sock = server.nextPendingConnection()
+        if sock:
+            sock.waitForReadyRead(500)
+            sock.readAll()
+            sock.disconnectFromServer()
+            window.wake_up()
+
+    server.newConnection.connect(handle_incoming_connection)
+
+    # 保证 server 对象在事件循环生命周期中不被垃圾回收
+    app._single_instance_server = server
 
     sys.exit(app.exec())
 

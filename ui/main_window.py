@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QTextEdit,
     QSplitter, QMessageBox, QSystemTrayIcon, QMenu, QStatusBar,
-    QProgressBar, QGroupBox, QButtonGroup, QAbstractItemView
+    QProgressBar, QGroupBox, QButtonGroup, QAbstractItemView, QFrame
 )
 
 from core.database import DatabaseManager
@@ -46,6 +46,14 @@ class MainWindow(QMainWindow):
         self._setup_timers()
         self._refresh_current_view()
 
+    def wake_up(self):
+        """唤醒并置顶窗口（针对单实例重复拉起场景）"""
+        if self.isMinimized():
+            self.showNormal()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
     def _init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -54,43 +62,63 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
 
         # -------------------------------------------------------------
-        # 1. 左侧导航边栏 (Width ~210)
+        # 1. 左侧导航边栏 (Width 230, 清晰分区)
         # -------------------------------------------------------------
         nav_panel = QWidget()
-        nav_panel.setFixedWidth(220)
-        nav_panel.setStyleSheet("background-color: #F1F5F9; border-right: 1px solid #E2E8F0;")
+        nav_panel.setObjectName("nav_panel")
+        nav_panel.setFixedWidth(230)
         nav_layout = QVBoxLayout(nav_panel)
-        nav_layout.setContentsMargins(12, 16, 12, 16)
+        nav_layout.setContentsMargins(14, 16, 14, 16)
         nav_layout.setSpacing(8)
 
-        # 软件标识
+        # 软件品牌标识
         logo_lbl = QLabel("📬 Coremail助手")
-        logo_lbl.setStyleSheet("font-size: 16px; font-weight: 700; color: #1E3A8A; margin-bottom: 6px;")
+        logo_lbl.setStyleSheet("font-size: 16px; font-weight: 700; color: #1E3A8A; margin-bottom: 2px;")
         nav_layout.addWidget(logo_lbl)
 
-        # 核心快捷操作按钮
+        sub_brand_lbl = QLabel("智能邮件协同与处理")
+        sub_brand_lbl.setStyleSheet("font-size: 11px; color: #64748B; margin-bottom: 6px;")
+        nav_layout.addWidget(sub_brand_lbl)
+
+        # 分区一：快捷功能动作按钮 (Action Buttons)
+        sec_actions_lbl = QLabel("⚡ 快捷功能")
+        sec_actions_lbl.setProperty("class", "nav_section_header")
+        nav_layout.addWidget(sec_actions_lbl)
+
         self.btn_sync_now = QPushButton("🔄 立即同步收信")
-        self.btn_sync_now.setObjectName("btn_primary")
-        self.btn_sync_now.setProperty("primary", True)
+        self.btn_sync_now.setObjectName("btn_sync_now")
         self.btn_sync_now.clicked.connect(self._start_manual_sync)
         nav_layout.addWidget(self.btn_sync_now)
 
-        self.btn_new_memo = QPushButton("➕ 新建自定义备忘")
+        self.btn_new_memo = QPushButton("➕ 新建备忘")
+        self.btn_new_memo.setObjectName("btn_new_memo")
         self.btn_new_memo.clicked.connect(self._create_independent_memo)
         nav_layout.addWidget(self.btn_new_memo)
 
-        nav_layout.addSpacing(10)
+        # 分割线
+        div1 = QFrame()
+        div1.setFrameShape(QFrame.HLine)
+        div1.setFrameShadow(QFrame.Sunken)
+        div1.setProperty("class", "nav_divider")
+        nav_layout.addWidget(div1)
 
-        # 视图切换单选按钮组
+        # 分区二：页面视图导航按钮 (Navigation Views)
+        sec_views_lbl = QLabel("📂 视图中心")
+        sec_views_lbl.setProperty("class", "nav_section_header")
+        nav_layout.addWidget(sec_views_lbl)
+
         self.nav_btn_group = QButtonGroup(self)
         self.btn_view_pending = QPushButton("📥 待流转协同")
+        self.btn_view_pending.setProperty("class", "nav_item")
         self.btn_view_pending.setCheckable(True)
         self.btn_view_pending.setChecked(True)
 
         self.btn_view_all = QPushButton("📑 全部历史邮件")
+        self.btn_view_all.setProperty("class", "nav_item")
         self.btn_view_all.setCheckable(True)
 
         self.btn_view_memos = QPushButton("📝 自定义备忘录")
+        self.btn_view_memos.setProperty("class", "nav_item")
         self.btn_view_memos.setCheckable(True)
 
         self.nav_btn_group.addButton(self.btn_view_pending, 1)
@@ -104,12 +132,24 @@ class MainWindow(QMainWindow):
 
         nav_layout.addStretch()
 
-        # 底部配置工具入口
-        self.btn_open_rules = QPushButton("👥 联系人与改写词典")
+        # 分区三：系统与管理辅助入口 (Bottom Utils)
+        div2 = QFrame()
+        div2.setFrameShape(QFrame.HLine)
+        div2.setFrameShadow(QFrame.Sunken)
+        div2.setProperty("class", "nav_divider")
+        nav_layout.addWidget(div2)
+
+        sec_mgmt_lbl = QLabel("⚙️ 系统管理")
+        sec_mgmt_lbl.setProperty("class", "nav_section_header")
+        nav_layout.addWidget(sec_mgmt_lbl)
+
+        self.btn_open_rules = QPushButton("👥 联系人与改写规则")
+        self.btn_open_rules.setProperty("class", "nav_util_btn")
         self.btn_open_rules.clicked.connect(self._open_rules_dialog)
         nav_layout.addWidget(self.btn_open_rules)
 
         self.btn_open_settings = QPushButton("⚙️ 系统与邮箱设置")
+        self.btn_open_settings.setProperty("class", "nav_util_btn")
         self.btn_open_settings.clicked.connect(self._open_settings_dialog)
         nav_layout.addWidget(self.btn_open_settings)
 
@@ -125,6 +165,18 @@ class MainWindow(QMainWindow):
         mid_layout = QVBoxLayout(mid_widget)
         mid_layout.setContentsMargins(12, 14, 12, 14)
         mid_layout.setSpacing(8)
+
+        # 列表顶部动态标题与条目计数
+        self.view_header_layout = QHBoxLayout()
+        self.view_title_lbl = QLabel("📥 待流转协同")
+        self.view_title_lbl.setStyleSheet("font-size: 15px; font-weight: 700; color: #0F172A;")
+        self.view_header_layout.addWidget(self.view_title_lbl)
+
+        self.view_count_lbl = QLabel("0 项")
+        self.view_count_lbl.setStyleSheet("color: #64748B; font-size: 12px;")
+        self.view_header_layout.addStretch()
+        self.view_header_layout.addWidget(self.view_count_lbl)
+        mid_layout.addLayout(self.view_header_layout)
 
         search_box = QHBoxLayout()
         self.search_input = QLineEdit()
@@ -290,9 +342,16 @@ class MainWindow(QMainWindow):
                 keyword=kw
             )
 
-            # 更新未读徽标计数
+            # 更新未读徽标计数与中栏视图标题
             pending_count = len(self.db.get_pending_emails())
             self.btn_view_pending.setText(f"📥 待流转协同 ({pending_count})")
+
+            if self.current_view == "pending":
+                self.view_title_lbl.setText("📥 待流转协同")
+                self.view_count_lbl.setText(f"共 {len(emails)} 封待协同邮件")
+            else:
+                self.view_title_lbl.setText("📑 全部历史邮件")
+                self.view_count_lbl.setText(f"共 {len(emails)} 封邮件")
 
             for em in emails:
                 item = QListWidgetItem()
@@ -315,8 +374,10 @@ class MainWindow(QMainWindow):
         elif self.current_view == "memos":
             self.mail_actions_group.setVisible(False)
             self.memo_actions_group.setVisible(True)
+            self.view_title_lbl.setText("📝 自定义备忘录")
 
             memos = self.db.get_memos(keyword=kw)
+            self.view_count_lbl.setText(f"共 {len(memos)} 条备忘")
             for m in memos:
                 item = QListWidgetItem()
                 pin_tag = "📌 " if m.get("is_pinned") else ""

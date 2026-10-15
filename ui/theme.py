@@ -83,6 +83,122 @@ QPushButton#btn_primary:pressed, QPushButton[primary="true"]:pressed {
     background-color: #1E40AF;
 }
 
+/* 侧边栏专用样式 (消除父级边框污染，解决边框显示不全) */
+#nav_panel {
+    background-color: #F8FAFC;
+    border-right: 1px solid #E2E8F0;
+}
+
+/* 侧边栏顶部功能动作按钮 */
+QPushButton#btn_sync_now {
+    background-color: #2563EB;
+    color: #FFFFFF;
+    border: 1px solid #1D4ED8;
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-weight: 600;
+    font-size: 13px;
+    text-align: center;
+    min-height: 22px;
+}
+
+QPushButton#btn_sync_now:hover {
+    background-color: #1D4ED8;
+    border-color: #1E40AF;
+}
+
+QPushButton#btn_sync_now:pressed {
+    background-color: #1E40AF;
+}
+
+QPushButton#btn_sync_now:disabled {
+    background-color: #93C5FD;
+    border-color: #60A5FA;
+    color: #FFFFFF;
+}
+
+QPushButton#btn_new_memo {
+    background-color: #FFFFFF;
+    color: #0F766E;
+    border: 1px solid #0D9488;
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-weight: 600;
+    font-size: 13px;
+    text-align: center;
+    min-height: 22px;
+}
+
+QPushButton#btn_new_memo:hover {
+    background-color: #F0FDFA;
+    border-color: #0F766E;
+}
+
+QPushButton#btn_new_memo:pressed {
+    background-color: #CCFBF1;
+}
+
+/* 侧边栏分类标签 */
+QLabel.nav_section_header, QLabel[class="nav_section_header"] {
+    color: #64748B;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 4px 2px 2px 2px;
+}
+
+/* 侧边栏视图切换选项卡按钮 (区分于操作按钮) */
+QPushButton.nav_item, QPushButton[class="nav_item"] {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 8px 12px;
+    text-align: left;
+    font-size: 13px;
+    font-weight: 500;
+    color: #334155;
+    min-height: 22px;
+}
+
+QPushButton.nav_item:hover, QPushButton[class="nav_item"]:hover {
+    background-color: #F1F5F9;
+    color: #0F172A;
+}
+
+QPushButton.nav_item:checked, QPushButton[class="nav_item"]:checked {
+    background-color: #EFF6FF;
+    color: #1D4ED8;
+    font-weight: 600;
+    border: 1px solid #BFDBFE;
+    border-left: 4px solid #2563EB;
+}
+
+/* 侧边栏底部辅助设置按钮 */
+QPushButton.nav_util_btn, QPushButton[class="nav_util_btn"] {
+    background-color: transparent;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    padding: 6px 10px;
+    text-align: left;
+    color: #64748B;
+    font-size: 12px;
+    min-height: 20px;
+}
+
+QPushButton.nav_util_btn:hover, QPushButton[class="nav_util_btn"]:hover {
+    background-color: #F1F5F9;
+    color: #1E293B;
+}
+
+/* 侧边栏分割线 */
+QFrame.nav_divider, QFrame[class="nav_divider"] {
+    border: none;
+    border-top: 1px solid #E2E8F0;
+    max-height: 1px;
+    margin: 6px 0;
+}
+
 /* 警示与忽略按钮 */
 QPushButton#btn_danger, QPushButton[danger="true"] {
     background-color: #FEF2F2;
