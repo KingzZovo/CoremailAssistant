@@ -78,7 +78,6 @@ excluded_modules = [
     'IPython',
     'notebook',
     'pytest',
-    'unittest',
     'sphinx',
 ]
 
@@ -88,6 +87,12 @@ a = Analysis(
     binaries=[],
     datas=datas,
     hiddenimports=[
+        'unittest',
+        'unittest.mock',
+        'pydoc',
+        'doctest',
+        'sklearn',
+        'sklearn.base',
         'sklearn.feature_extraction.text',
         'sklearn.linear_model',
         'sklearn.linear_model._stochastic_gradient',

@@ -4,11 +4,29 @@ import os
 import re
 import difflib
 from typing import Dict, Any, List, Tuple, Optional
-import joblib
-import jieba
-import numpy as np
-from sklearn.feature_extraction.text import HashingVectorizer
-from sklearn.linear_model import SGDClassifier
+try:
+    import joblib
+except Exception:
+    joblib = None
+
+try:
+    import jieba
+except Exception:
+    jieba = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    from sklearn.feature_extraction.text import HashingVectorizer
+    from sklearn.linear_model import SGDClassifier
+    HAS_SKLEARN = True
+except Exception:
+    HashingVectorizer = None
+    SGDClassifier = None
+    HAS_SKLEARN = False
 
 from config import ML_MODELS_PATH
 
@@ -17,25 +35,40 @@ class LocalEmailLearner:
     """
     基于邮件全文语义特征 + 全文编辑差异(Diff)对比的本地增量机器学习引擎。
     专为纯内网环境（10代 i5 + 16GB 内存）设计，不截断正文，直接分析邮件全文。
+    若极端运行环境缺失 C 扩展依赖，自动平滑降级为内置纯 Python 词频统计预测。
     """
 
     def __init__(self, model_path: str = ML_MODELS_PATH):
         self.model_path = model_path
         # 使用 2^15 维特征空间，对整封邮件全文提取分词与双词共现特征
-        self.vectorizer = HashingVectorizer(
-            n_features=2**15,
-            analyzer=self._fulltext_ngram_analyzer,
-            alternate_sign=False
-        )
-        # 1. 全文是否需要流转分类器 (0: 忽略, 1: 需流转处理)
-        self.action_clf = SGDClassifier(loss="log_loss", random_state=42)
-        self.action_fitted = False
+        if HAS_SKLEARN and HashingVectorizer is not None:
+            try:
+                self.vectorizer = HashingVectorizer(
+                    n_features=2**15,
+                    analyzer=self._fulltext_ngram_analyzer,
+                    alternate_sign=False
+                )
+            except Exception:
+                self.vectorizer = None
+        else:
+            self.vectorizer = None
 
-        # 2. 全文流转方式分类器 (0: standard_forward 标准转发, 1: rewrite_new 改写新建邮件)
-        self.mode_clf = SGDClassifier(loss="log_loss", random_state=42)
+        # 1. 全文是否需要流转分类器 (0: 忽略, 1: 需流转处理)
+        if HAS_SKLEARN and SGDClassifier is not None:
+            try:
+                self.action_clf = SGDClassifier(loss="log_loss", random_state=42)
+                self.mode_clf = SGDClassifier(loss="log_loss", random_state=42)
+            except Exception:
+                self.action_clf = None
+                self.mode_clf = None
+        else:
+            self.action_clf = None
+            self.mode_clf = None
+
+        self.action_fitted = False
         self.mode_fitted = False
 
-        # 3. 发件人 & 全文词组 -> 目标收件人 F 的权重统计矩阵
+        # 3. 发件人 & 全文词组 -> 目标收件人 F 的权重统计矩阵 (纯 Python 统计，永远安全)
         self.sender_to_target_stats: Dict[str, Dict[str, float]] = {}
         self.token_to_target_stats: Dict[str, Dict[str, float]] = {}
         self._load()
@@ -45,7 +78,15 @@ class LocalEmailLearner:
         """对邮件全文进行中文分词，并同时生成 Unigram（单词）与 Bigram（相邻双词短语）特征"""
         if not text:
             return []
-        words = [w.strip().lower() for w in jieba.lcut(text) if len(w.strip()) >= 2]
+        words = []
+        try:
+            if jieba is not None:
+                words = [w.strip().lower() for w in jieba.lcut(text) if len(w.strip()) >= 2]
+        except Exception:
+            words = []
+        if not words:
+            # 纯 Python 降级正则分词 (提取连续中文或英文词组)
+            words = [w.strip().lower() for w in re.findall(r"[\u4e00-\u9fa5]{2,}|[a-zA-Z0-9_-]{2,}", text)]
         bigrams = [f"{words[i]}_{words[i+1]}" for i in range(len(words) - 1)]
         return words + bigrams
 
@@ -70,18 +111,19 @@ class LocalEmailLearner:
         full_body = email_data.get("body_text") or ""
 
         feat_text = self._build_full_feature_text(sender, cc_list, subject, full_body)
-        X = self.vectorizer.transform([feat_text])
 
         need_prob = 0.5
-        if self.action_fitted:
+        if self.vectorizer and self.action_clf and self.action_fitted:
             try:
+                X = self.vectorizer.transform([feat_text])
                 need_prob = float(self.action_clf.predict_proba(X)[0][1])
             except Exception:
                 need_prob = 0.5
 
         rec_mode = "rewrite_new"
-        if self.mode_fitted:
+        if self.vectorizer and self.mode_clf and self.mode_fitted:
             try:
+                X = self.vectorizer.transform([feat_text])
                 m_prob = float(self.mode_clf.predict_proba(X)[0][1])
                 rec_mode = "rewrite_new" if m_prob >= 0.5 else "standard_forward"
             except Exception:
@@ -125,17 +167,21 @@ class LocalEmailLearner:
         full_body = email_data.get("body_text") or ""
 
         feat_text = self._build_full_feature_text(sender, cc_list, subject, full_body)
-        X = self.vectorizer.transform([feat_text])
+        if self.vectorizer and self.action_clf and np is not None:
+            try:
+                X = self.vectorizer.transform([feat_text])
+                y_action = np.array([1 if action_label else 0])
+                self.action_clf.partial_fit(X, y_action, classes=np.array([0, 1]))
+                self.action_fitted = True
 
-        y_action = np.array([1 if action_label else 0])
-        self.action_clf.partial_fit(X, y_action, classes=np.array([0, 1]))
-        self.action_fitted = True
+                if action_label == 1 and self.mode_clf:
+                    y_mode = np.array([1 if chosen_mode == "rewrite_new" else 0])
+                    self.mode_clf.partial_fit(X, y_mode, classes=np.array([0, 1]))
+                    self.mode_fitted = True
+            except Exception:
+                pass
 
         if action_label == 1:
-            y_mode = np.array([1 if chosen_mode == "rewrite_new" else 0])
-            self.mode_clf.partial_fit(X, y_mode, classes=np.array([0, 1]))
-            self.mode_fitted = True
-
             full_tokens = set(self._fulltext_ngram_analyzer(f"{subject} {full_body}"))
             for f_addr in (chosen_f_emails or []):
                 f_clean = f_addr.lower().strip()
@@ -202,9 +248,17 @@ class LocalEmailLearner:
 
     def reset_models(self) -> None:
         """重置本地机器学习模型"""
-        self.action_clf = SGDClassifier(loss="log_loss", random_state=42)
+        if HAS_SKLEARN and SGDClassifier is not None:
+            try:
+                self.action_clf = SGDClassifier(loss="log_loss", random_state=42)
+                self.mode_clf = SGDClassifier(loss="log_loss", random_state=42)
+            except Exception:
+                self.action_clf = None
+                self.mode_clf = None
+        else:
+            self.action_clf = None
+            self.mode_clf = None
         self.action_fitted = False
-        self.mode_clf = SGDClassifier(loss="log_loss", random_state=42)
         self.mode_fitted = False
         self.sender_to_target_stats = {}
         self.token_to_target_stats = {}
@@ -216,25 +270,32 @@ class LocalEmailLearner:
 
     def _save(self) -> None:
         """持久化保存模型状态"""
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-        joblib.dump({
-            "action_clf": self.action_clf,
-            "action_fitted": self.action_fitted,
-            "mode_clf": self.mode_clf,
-            "mode_fitted": self.mode_fitted,
-            "sender_stats": self.sender_to_target_stats,
-            "token_stats": self.token_to_target_stats
-        }, self.model_path)
+        if joblib is None:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
+            joblib.dump({
+                "action_clf": self.action_clf,
+                "action_fitted": self.action_fitted,
+                "mode_clf": self.mode_clf,
+                "mode_fitted": self.mode_fitted,
+                "sender_stats": self.sender_to_target_stats,
+                "token_stats": self.token_to_target_stats
+            }, self.model_path)
+        except Exception:
+            pass
 
     def _load(self) -> None:
         """加载已持久化的模型"""
-        if not os.path.isfile(self.model_path):
+        if joblib is None or not os.path.isfile(self.model_path):
             return
         try:
             data = joblib.load(self.model_path)
-            self.action_clf = data.get("action_clf", self.action_clf)
+            if self.action_clf is not None:
+                self.action_clf = data.get("action_clf", self.action_clf)
             self.action_fitted = data.get("action_fitted", False)
-            self.mode_clf = data.get("mode_clf", self.mode_clf)
+            if self.mode_clf is not None:
+                self.mode_clf = data.get("mode_clf", self.mode_clf)
             self.mode_fitted = data.get("mode_fitted", False)
             self.sender_to_target_stats = data.get("sender_stats", {})
             self.token_to_target_stats = data.get("token_stats", {})
