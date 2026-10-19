@@ -333,3 +333,62 @@ class SendMailWorker(QThread):
 
         except Exception as e:
             self.send_failed.emit(f"发送邮件失败: {str(e)}")
+
+
+class EmailBodyLoadWorker(QThread):
+    """异步后台拉取单封邮件正文与附件的工作线程（防 UI 卡顿与未响应）"""
+
+    body_loaded = Signal(str, dict)  # (uid, updated_email_data)
+    load_failed = Signal(str, str)   # (uid, error_message)
+
+    def __init__(self, email_data: Dict[str, Any], settings: Optional[Dict[str, Any]] = None, parent=None):
+        super().__init__(parent)
+        self.email_data = dict(email_data)
+        self.settings = settings
+        self.db = DatabaseManager()
+
+    def run(self):
+        uid = self.email_data.get("uid", "")
+        if not uid:
+            self.load_failed.emit("", "无效的邮件唯一标识")
+            return
+
+        try:
+            cfg = self.settings or self.db.get_all_settings()
+            client = CoremailClient(cfg)
+            folder_param = self.email_data.get("raw_folder") or self.email_data.get("folder_name", "INBOX")
+            detail = client.fetch_single_email_detail(uid, folder_name=folder_param)
+
+            body_text = detail.get("body_text", "")
+            body_html = detail.get("body_html", "")
+            attachments = detail.get("attachments", [])
+            is_loaded = detail.get("is_body_loaded", 1 if (body_text or body_html) else 0)
+
+            # 更新内存对象
+            self.email_data["body_text"] = body_text
+            self.email_data["body_html"] = body_html
+            self.email_data["attachments"] = attachments
+            self.email_data["is_body_loaded"] = is_loaded
+
+            if detail.get("subject"):
+                self.email_data["subject"] = detail["subject"]
+            if detail.get("sender_name"):
+                self.email_data["sender_name"] = detail["sender_name"]
+            if detail.get("sender_email"):
+                self.email_data["sender_email"] = detail["sender_email"]
+
+            # 若正文或附件成功拿到，则同步到本地数据库并通知 UI
+            if body_text or body_html or attachments:
+                self.db.update_email_body_and_attachments(
+                    uid=uid,
+                    body_text=body_text,
+                    body_html=body_html,
+                    attachments=attachments
+                )
+                self.body_loaded.emit(uid, self.email_data)
+            else:
+                err_msg = "邮件服务器未返回正文内容（可能邮件在服务端已被彻底删除或归档）"
+                self.load_failed.emit(uid, err_msg)
+        except Exception as e:
+            self.load_failed.emit(uid, f"拉取正文异常: {str(e)}")
+

@@ -11,7 +11,9 @@ from core.mail_client import (
     CoremailClient,
     decode_imap_utf7,
     is_system_non_inbox_folder,
+    _extract_body_from_coremail_json,
 )
+from core.worker_threads import EmailBodyLoadWorker
 from ui.settings_dialog import SettingsDialog
 from ui.main_window import MainWindow
 from ui.compose_send_dialog import ComposeAndSendDialog
@@ -446,6 +448,155 @@ class TestCoremailProtocolAndUI(unittest.TestCase):
         detail = client.fetch_single_email_detail("mid_test_detail", folder_name="重要项目组")
         self.assertEqual(detail["is_body_loaded"], 1)
         self.assertIn("下午两点准时开会", detail["body_text"])
+
+    def test_extract_body_from_coremail_json(self):
+        # 1. Nested html.content and text.content
+        data1 = {"html": {"content": "<b>Important Notice</b>"}, "text": {"content": "Important Notice"}}
+        t1, h1 = _extract_body_from_coremail_json(data1)
+        self.assertEqual(t1, "Important Notice")
+        self.assertEqual(h1, "<b>Important Notice</b>")
+
+        # 2. String fields
+        data2 = {"html": "<p>Meeting at 3PM</p>", "text": "Meeting at 3PM"}
+        t2, h2 = _extract_body_from_coremail_json(data2)
+        self.assertEqual(t2, "Meeting at 3PM")
+        self.assertEqual(h2, "<p>Meeting at 3PM</p>")
+
+        # 3. Direct htmlBody and textBody
+        data3 = {"htmlBody": "<p>Project Update</p>", "textBody": "Project Update"}
+        t3, h3 = _extract_body_from_coremail_json(data3)
+        self.assertEqual(t3, "Project Update")
+        self.assertEqual(h3, "<p>Project Update</p>")
+
+        # 4. Parts list
+        data4 = {
+            "parts": [
+                {"type": "text/plain", "content": "Plain content from part"},
+                {"type": "text/html", "content": "<div>HTML content from part</div>"}
+            ]
+        }
+        t4, h4 = _extract_body_from_coremail_json(data4)
+        self.assertEqual(t4, "Plain content from part")
+        self.assertEqual(h4, "<div>HTML content from part</div>")
+
+        # 5. HTML-only with tag stripping fallback
+        data5 = {"html": "<div><span>Hello</span> <b>World!</b></div>"}
+        t5, h5 = _extract_body_from_coremail_json(data5)
+        self.assertEqual(t5, "Hello World!")
+        self.assertEqual(h5, "<div><span>Hello</span> <b>World!</b></div>")
+
+    @patch("imaplib.IMAP4")
+    def test_fetch_single_email_detail_imap_raw_folder_and_uid(self, mock_imap_cls):
+        mock_conn = MagicMock()
+        mock_imap_cls.return_value = mock_conn
+
+        mock_conn.select.return_value = ("OK", [b"1"])
+        eml_bytes = (
+            b"From: sender@corp.cn\r\n"
+            b"To: me@corp.cn\r\n"
+            b"Subject: Test IMAP Fetch\r\n\r\n"
+            b"Content body in IMAP"
+        )
+        mock_conn.uid.return_value = ("OK", [(b"1024 (RFC822 {50}", eml_bytes)])
+
+        cfg = {
+            "protocol_mode": "imap_smtp",
+            "imap_host": "mail.corp.cn",
+            "imap_port": 143,
+            "imap_ssl": False,
+            "email_account": "me@corp.cn",
+            "email_password": "pwd",
+        }
+        client = CoremailClient(cfg)
+
+        detail = client.fetch_single_email_detail("IMAP::&XfJT0ZAB-::1024")
+        mock_conn.select.assert_called_with('"&XfJT0ZAB-"', readonly=True)
+        mock_conn.uid.assert_called_with("fetch", "1024", "(BODY.PEEK[])")
+        self.assertEqual(detail["is_body_loaded"], 1)
+        self.assertIn("Content body in IMAP", detail["body_text"])
+
+    @patch("core.worker_threads.CoremailClient")
+    @patch("core.worker_threads.DatabaseManager")
+    def test_email_body_load_worker(self, mock_db_cls, mock_client_cls):
+        mock_db = MagicMock()
+        mock_db_cls.return_value = mock_db
+
+        mock_client = MagicMock()
+        mock_client_cls.return_value = mock_client
+        mock_client.fetch_single_email_detail.return_value = {
+            "subject": "Worker Subject",
+            "body_text": "Worker text body",
+            "body_html": "<p>Worker html body</p>",
+            "attachments": [],
+            "is_body_loaded": 1
+        }
+
+        email_data = {
+            "uid": "IMAP::INBOX::999",
+            "raw_folder": "INBOX",
+            "subject": "Old Subject",
+            "body_text": ""
+        }
+        worker = EmailBodyLoadWorker(email_data)
+
+        results = []
+        worker.body_loaded.connect(lambda uid, data: results.append((uid, data)))
+        worker.run()
+
+        self.assertEqual(len(results), 1)
+        uid, res_data = results[0]
+        self.assertEqual(uid, "IMAP::INBOX::999")
+        self.assertEqual(res_data["body_text"], "Worker text body")
+        self.assertEqual(res_data["is_body_loaded"], 1)
+        mock_db.update_email_body_and_attachments.assert_called_once()
+
+    def test_backup_and_restore_zip_logic(self):
+        import tempfile
+        import zipfile
+        import os
+
+        with tempfile.TemporaryDirectory() as src_dir, tempfile.TemporaryDirectory() as dst_dir:
+            db_file = os.path.join(src_dir, "assistant.db")
+            with open(db_file, "w") as f:
+                f.write("SQLITE_DUMMY_DATA")
+
+            sub_dir = os.path.join(src_dir, "attachments")
+            os.makedirs(sub_dir, exist_ok=True)
+            att_file = os.path.join(sub_dir, "test.pdf")
+            with open(att_file, "w") as f:
+                f.write("PDF_DUMMY_DATA")
+
+            zip_path = os.path.join(dst_dir, "backup.zip")
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(src_dir):
+                    for file in files:
+                        fp = os.path.join(root, file)
+                        zipf.write(fp, os.path.relpath(fp, src_dir))
+
+            self.assertTrue(os.path.exists(zip_path))
+
+            restore_dir = os.path.join(dst_dir, "restored")
+            with zipfile.ZipFile(zip_path, "r") as zipf:
+                zipf.extractall(restore_dir)
+
+            restored_db = os.path.join(restore_dir, "assistant.db")
+            restored_att = os.path.join(restore_dir, "attachments", "test.pdf")
+            self.assertTrue(os.path.exists(restored_db))
+            self.assertTrue(os.path.exists(restored_att))
+            with open(restored_db, "r") as f:
+                self.assertEqual(f.read(), "SQLITE_DUMMY_DATA")
+
+    def test_main_window_worker_tracking_and_tray(self):
+        win = MainWindow()
+        self.assertTrue(hasattr(win, "_active_workers"))
+        self.assertIsNotNone(win.tray_icon)
+        self.assertIsNotNone(win.btn_minimize_tray)
+
+        dummy_worker = MagicMock()
+        win._track_worker(dummy_worker)
+        self.assertIn(dummy_worker, win._active_workers)
+        win._untrack_worker(dummy_worker)
+        self.assertNotIn(dummy_worker, win._active_workers)
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ from typing import List, Dict, Any, Optional, Tuple
 import requests
 import urllib3
 
+from config import ATTACHMENTS_DIR
+
 # 忽略内网自签名证书安全警告
 urllib3.disable_warnings()
 
@@ -158,6 +160,62 @@ def is_system_non_inbox_folder(folder_id: Any, folder_name: str) -> bool:
         "draft", "sent", "trash", "junk", "spam", "deleted"
     ]
     return any(k in lower for k in exclude_keywords)
+
+
+def _extract_body_from_coremail_json(var_data: Any) -> Tuple[str, str]:
+    """
+    通用提取 Coremail WebAPI (mbox:readMessage / mbox:getMessageData / mbox:getMessageInfos)
+    返回的多种嵌套结构中的 html 和 text 正文
+    返回 (body_text, body_html)
+    """
+    if not isinstance(var_data, dict):
+        return "", ""
+
+    body_html = ""
+    body_text = ""
+
+    # 1. 结构: {"html": {"content": ...}} 或 {"html": "..."}
+    h_val = var_data.get("html")
+    if isinstance(h_val, dict):
+        body_html = h_val.get("content") or h_val.get("body") or ""
+    elif isinstance(h_val, str):
+        body_html = h_val
+
+    # 2. 结构: {"text": {"content": ...}} 或 {"text": "..."}
+    t_val = var_data.get("text")
+    if isinstance(t_val, dict):
+        body_text = t_val.get("content") or t_val.get("body") or ""
+    elif isinstance(t_val, str):
+        body_text = t_val
+
+    # 3. 直接字段: content / body / htmlBody / textBody
+    if not body_html:
+        body_html = var_data.get("htmlBody") or var_data.get("content") or var_data.get("body") or ""
+    if not body_text:
+        body_text = var_data.get("textBody") or ""
+
+    # 4. parts 列表: [{"type": "text/html", "content": ...}, {"type": "text/plain", "content": ...}]
+    parts = var_data.get("parts") or []
+    if isinstance(parts, list):
+        for p in parts:
+            if not isinstance(p, dict):
+                continue
+            p_type = str(p.get("type") or p.get("contentType") or "").lower()
+            p_content = p.get("content") or p.get("body") or ""
+            if "html" in p_type and not body_html:
+                body_html = p_content
+            elif "plain" in p_type and not body_text:
+                body_text = p_content
+
+    # 如果有 html 但没有 text，通过正则清洗 html 标签作为 text
+    if not body_text and body_html:
+        clean = re.sub(r"<style[\s\S]*?</style>", "", body_html, flags=re.I)
+        clean = re.sub(r"<script[\s\S]*?</script>", "", clean, flags=re.I)
+        clean = re.sub(r"<[^>]+>", " ", clean)
+        clean = re.sub(r"\s+", " ", clean).strip()
+        body_text = clean
+
+    return body_text, body_html
 
 
 def probe_coremail_server_ports(raw_host: str) -> Dict[str, Any]:
@@ -315,7 +373,7 @@ class CoremailClient:
     probe_coremail_server_ports = staticmethod(probe_coremail_server_ports)
     auto_detect_server = staticmethod(probe_coremail_server_ports)
 
-    def __init__(self, config: Dict[str, Any], attachment_root: str = "data/attachments"):
+    def __init__(self, config: Dict[str, Any], attachment_root: Optional[str] = None):
         self.config = config
         self.protocol_mode = config.get("protocol_mode", "coremail")
         self.coremail_server = config.get("coremail_server", "").strip()
@@ -337,13 +395,23 @@ class CoremailClient:
         self.email_account = config.get("email_account", "").strip()
         self.email_password = config.get("email_password", "")
         self.sender_display_name = config.get("sender_display_name", "").strip()
-        self.attachment_root = attachment_root
+        self.attachment_root = str(attachment_root or ATTACHMENTS_DIR)
         os.makedirs(self.attachment_root, exist_ok=True)
 
         # WebAPI 会话与缓存
         self._http_session: Optional[requests.Session] = None
         self._cached_sid: Optional[str] = None
         self._cached_base_url: Optional[str] = None
+
+    def _persist_working_config(self, **kwargs):
+        """将自动探测或回退跑通的端口与设置写回本地数据库，避免下次连接重复超时重试"""
+        try:
+            from core.database import DatabaseManager
+            db = DatabaseManager()
+            for k, v in kwargs.items():
+                db.save_setting(k, str(v))
+        except Exception:
+            pass
 
     def _get_http_session(self) -> requests.Session:
         if self._http_session is None:
@@ -415,7 +483,7 @@ class CoremailClient:
                         login_url,
                         json=payload,
                         headers={"Content-Type": "application/json; charset=UTF-8"},
-                        timeout=5.0
+                        timeout=4.0
                     )
                     if resp.status_code == 200:
                         try:
@@ -430,6 +498,9 @@ class CoremailClient:
                             if sid:
                                 self._cached_sid = sid
                                 self._cached_base_url = base_url
+                                if self.http_base_url != base_url:
+                                    self.http_base_url = base_url
+                                    self._persist_working_config(http_base_url=base_url)
                                 return base_url, sid
                         elif code in ("FA_UNAUTHORIZED", "FA_PASSWORD_ERROR", "FA_USER_NOT_EXIST") or "password" in str(data.get("message", "")).lower():
                             auth_failed = True
@@ -582,85 +653,90 @@ class CoremailClient:
     def fetch_single_email_detail(self, uid: str, folder_name: str = "INBOX") -> Dict[str, Any]:
         """
         按需单独拉取某一封邮件的完整正文 (HTML/Text) 并下载附件至本地磁盘 (Lazy-Load)
-        优先通过 /coremail/s/eml 原文下载，次选 mbox:readMessage JSON 模式，或回退 IMAP
+        优先通过 /coremail/s/eml 原文下载，次选 mbox:readMessage/getMessageData JSON 模式，或回退 IMAP
         """
         # 1. WebAPI 模式
         if self.protocol_mode == "coremail":
             try:
                 base_url, sid = self._http_login()
                 session = self._get_http_session()
+                raw_mid = uid.split("::")[-1] if "::" in str(uid) else str(uid)
 
                 # 方式 A：优先 EML 方式拉取原始数据（100% 完整解析富文本与附件）
-                try:
-                    eml_url = f"{base_url}/coremail/s/eml?sid={sid}&mid={quote(str(uid))}"
-                    eml_resp = session.get(eml_url, timeout=20.0)
-                    if eml_resp.status_code == 200 and eml_resp.content and len(eml_resp.content) > 10:
-                        parsed = self._parse_raw_email(str(uid), eml_resp.content)
-                        if parsed:
-                            return {
-                                "subject": parsed.get("subject", ""),
-                                "sender_name": parsed.get("sender_name", ""),
-                                "sender_email": parsed.get("sender_email", ""),
-                                "to_list": parsed.get("to_list", []),
-                                "cc_list": parsed.get("cc_list", []),
-                                "date_str": parsed.get("date_str", ""),
-                                "body_text": parsed.get("body_text", ""),
-                                "body_html": parsed.get("body_html", ""),
-                                "attachments": parsed.get("attachments", []),
-                                "is_body_loaded": 1
-                            }
-                except Exception:
-                    pass
+                for eml_url in [
+                    f"{base_url}/coremail/s/eml?sid={sid}&mid={quote(raw_mid)}",
+                    f"{base_url}/coremail/XT5/jsp/download.jsp?sid={sid}&mid={quote(raw_mid)}"
+                ]:
+                    try:
+                        eml_resp = session.get(eml_url, timeout=15.0)
+                        if eml_resp.status_code == 200 and eml_resp.content and len(eml_resp.content) > 10:
+                            parsed = self._parse_raw_email(str(uid), eml_resp.content)
+                            if parsed and (parsed.get("body_text") or parsed.get("body_html") or parsed.get("attachments")):
+                                return {
+                                    "subject": parsed.get("subject", ""),
+                                    "sender_name": parsed.get("sender_name", ""),
+                                    "sender_email": parsed.get("sender_email", ""),
+                                    "to_list": parsed.get("to_list", []),
+                                    "cc_list": parsed.get("cc_list", []),
+                                    "date_str": parsed.get("date_str", ""),
+                                    "body_text": parsed.get("body_text", ""),
+                                    "body_html": parsed.get("body_html", ""),
+                                    "attachments": parsed.get("attachments", []),
+                                    "is_body_loaded": 1
+                                }
+                    except Exception:
+                        continue
 
-                # 方式 B：mbox:readMessage JSON 回退解析
-                read_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:readMessage"
-                read_resp = session.post(
-                    read_url,
-                    json={"mid": uid, "mode": "html", "markRead": False},
-                    timeout=20.0
-                )
-                if read_resp.status_code == 200:
-                    rdata = read_resp.json()
-                    if rdata.get("code") == "S_OK":
-                        m_var = rdata.get("var", {})
-                        body_html = m_var.get("html") or m_var.get("content") or ""
-                        body_text = m_var.get("text") or ""
-                        if not body_text and body_html:
-                            body_text = re.sub(r"<[^>]+>", " ", body_html)
-                            body_text = re.sub(r"\s+", " ", body_text).strip()
+                # 方式 B：mbox:readMessage / mbox:getMessageData / mbox:getMessageInfos JSON 回退解析
+                for func_name in ["mbox:readMessage", "mbox:getMessageData", "mbox:getMessageInfos"]:
+                    try:
+                        read_url = f"{base_url}/coremail/s/json?sid={sid}&func={func_name}"
+                        read_resp = session.post(
+                            read_url,
+                            json={"mid": raw_mid, "mode": "html", "markRead": False},
+                            timeout=15.0
+                        )
+                        if read_resp.status_code == 200:
+                            rdata = read_resp.json()
+                            if rdata.get("code") == "S_OK":
+                                m_var = rdata.get("var", {})
+                                body_text, body_html = _extract_body_from_coremail_json(m_var)
 
-                        attachments = []
-                        raw_atts = m_var.get("attachments") or []
-                        if raw_atts:
-                            uid_attach_dir = os.path.join(self.attachment_root, str(uid))
-                            os.makedirs(uid_attach_dir, exist_ok=True)
-                            for att in raw_atts:
-                                aid = att.get("id") or att.get("aid")
-                                att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
-                                safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
-                                att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
+                                attachments = []
+                                raw_atts = m_var.get("attachments") or []
+                                if raw_atts:
+                                    uid_attach_dir = os.path.join(self.attachment_root, re.sub(r'[\\/:*?"<>|]', "_", str(uid)))
+                                    os.makedirs(uid_attach_dir, exist_ok=True)
+                                    for att in raw_atts:
+                                        aid = att.get("id") or att.get("aid")
+                                        att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
+                                        safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
+                                        att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
 
-                                if aid is not None:
-                                    att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(str(uid))}&aid={aid}"
-                                    try:
-                                        att_resp = session.get(att_url, timeout=25.0)
-                                        if att_resp.status_code == 200:
-                                            with open(att_path, "wb") as af:
-                                                af.write(att_resp.content)
-                                            attachments.append({
-                                                "filename": safe_fname,
-                                                "filepath": att_path,
-                                                "size": len(att_resp.content)
-                                            })
-                                    except Exception:
-                                        pass
+                                        if aid is not None:
+                                            att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(raw_mid)}&aid={aid}"
+                                            try:
+                                                att_resp = session.get(att_url, timeout=20.0)
+                                                if att_resp.status_code == 200:
+                                                    with open(att_path, "wb") as af:
+                                                        af.write(att_resp.content)
+                                                    attachments.append({
+                                                        "filename": safe_fname,
+                                                        "filepath": att_path,
+                                                        "size": len(att_resp.content)
+                                                    })
+                                            except Exception:
+                                                pass
 
-                        return {
-                            "body_text": body_text,
-                            "body_html": body_html,
-                            "attachments": attachments,
-                            "is_body_loaded": 1
-                        }
+                                if body_text or body_html or attachments:
+                                    return {
+                                        "body_text": body_text,
+                                        "body_html": body_html,
+                                        "attachments": attachments,
+                                        "is_body_loaded": 1
+                                    }
+                    except Exception:
+                        continue
             except Exception as e:
                 if isinstance(e, ValueError) and "认证失败" in str(e):
                     raise e
@@ -669,17 +745,32 @@ class CoremailClient:
         try:
             conn = self._connect_imap()
             try:
-                mailbox_arg = f'"{folder_name}"' if not folder_name.startswith('"') else folder_name
+                target_raw_folder = folder_name
+                raw_imap_uid = str(uid)
+                if str(uid).startswith("IMAP::"):
+                    parts = str(uid).split("::", 2)
+                    if len(parts) == 3:
+                        target_raw_folder = parts[1]
+                        raw_imap_uid = parts[2]
+                else:
+                    digits = re.findall(r'\d+', str(uid))
+                    if digits:
+                        raw_imap_uid = digits[-1]
+
+                mailbox_arg = f'"{target_raw_folder}"' if not str(target_raw_folder).startswith('"') else target_raw_folder
                 typ, _ = conn.select(mailbox_arg, readonly=True)
                 if typ != "OK":
                     conn.select("INBOX", readonly=True)
 
-                typ, msg_data = conn.uid("fetch", str(uid), "(BODY.PEEK[])")
+                typ, msg_data = conn.uid("fetch", str(raw_imap_uid), "(BODY.PEEK[])")
+                if typ != "OK" or not msg_data or not msg_data[0] or not msg_data[0][1]:
+                    typ, msg_data = conn.uid("fetch", str(raw_imap_uid), "(RFC822)")
+
                 if typ == "OK" and msg_data and msg_data[0]:
                     raw_bytes = msg_data[0][1]
-                    if isinstance(raw_bytes, bytes):
+                    if isinstance(raw_bytes, bytes) and len(raw_bytes) > 10:
                         parsed = self._parse_raw_email(str(uid), raw_bytes)
-                        if parsed:
+                        if parsed and (parsed.get("body_text") or parsed.get("body_html") or parsed.get("attachments")):
                             return {
                                 "subject": parsed.get("subject", ""),
                                 "sender_name": parsed.get("sender_name", ""),
@@ -812,9 +903,9 @@ class CoremailClient:
 
         try:
             if self.imap_ssl:
-                conn = imaplib.IMAP4_SSL(clean_host, self.imap_port, timeout=15)
+                conn = imaplib.IMAP4_SSL(clean_host, self.imap_port, timeout=4.0)
             else:
-                conn = imaplib.IMAP4(clean_host, self.imap_port, timeout=15)
+                conn = imaplib.IMAP4(clean_host, self.imap_port, timeout=4.0)
             conn.login(self.email_account, self.email_password)
             return conn
         except (socket.gaierror, Exception) as primary_err:
@@ -828,10 +919,11 @@ class CoremailClient:
             # 在 coremail 模式下若 993 SSL 失败，自动尝试回退降级到 143 明文端口
             if self.protocol_mode == "coremail" and self.imap_ssl:
                 try:
-                    conn = imaplib.IMAP4(clean_host, 143, timeout=10)
+                    conn = imaplib.IMAP4(clean_host, 143, timeout=4.0)
                     conn.login(self.email_account, self.email_password)
                     self.imap_port = 143
                     self.imap_ssl = False
+                    self._persist_working_config(imap_port=143, imap_ssl="0")
                     return conn
                 except Exception:
                     pass
@@ -1000,11 +1092,15 @@ class CoremailClient:
                         continue
 
                     all_uids = [u.decode("utf-8") for u in data[0].split()]
-                    candidate_uids = [u for u in all_uids[-max_fetch_per_folder:] if u not in existing_uids]
+                    candidate_uids = []
+                    for u in all_uids[-max_fetch_per_folder:]:
+                        full_uid = f"IMAP::{raw_folder}::{u}"
+                        if full_uid not in existing_uids and u not in existing_uids:
+                            candidate_uids.append((u, full_uid))
 
-                    for uid in candidate_uids:
+                    for raw_uid, full_uid in candidate_uids:
                         try:
-                            typ, msg_data = conn.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+                            typ, msg_data = conn.uid("fetch", raw_uid, "(BODY.PEEK[HEADER])")
                             if typ != "OK" or not msg_data or not msg_data[0]:
                                 continue
                             raw_header = msg_data[0][1]
@@ -1024,7 +1120,9 @@ class CoremailClient:
                             cc_list = parse_address_list(msg.get_all("Cc", []))
 
                             headers.append({
-                                "uid": uid,
+                                "uid": full_uid,
+                                "raw_uid": raw_uid,
+                                "raw_folder": raw_folder,
                                 "message_id": message_id,
                                 "subject": subject,
                                 "sender_name": sender_name,
@@ -1033,7 +1131,6 @@ class CoremailClient:
                                 "cc_list": cc_list,
                                 "date_str": date_str,
                                 "folder_name": decoded_folder,
-                                "raw_folder": raw_folder,
                                 "body_text": "",
                                 "body_html": "",
                                 "attachments": [],
@@ -1393,6 +1490,7 @@ class CoremailClient:
                     smtp.sendmail(self.email_account, all_recipients, raw_message)
                     self.smtp_port = 25
                     self.smtp_ssl = False
+                    self._persist_working_config(smtp_port=25, smtp_ssl="0")
                 except Exception:
                     raise primary_smtp_err
             else:

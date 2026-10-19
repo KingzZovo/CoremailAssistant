@@ -7,19 +7,20 @@ import os
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QEvent
 from PySide6.QtGui import QIcon, QAction
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QPushButton,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QTextEdit,
     QSplitter, QMessageBox, QSystemTrayIcon, QMenu, QStatusBar,
-    QProgressBar, QGroupBox, QButtonGroup, QAbstractItemView, QFrame
+    QProgressBar, QGroupBox, QButtonGroup, QAbstractItemView, QFrame,
+    QStyle, QApplication
 )
 
 from core.database import DatabaseManager
 from core.mail_client import CoremailClient
 from core.ml_learner import LocalEmailLearner
-from core.worker_threads import MailSyncWorker
+from core.worker_threads import MailSyncWorker, EmailBodyLoadWorker
 from .compose_send_dialog import ComposeAndSendDialog
 from .memo_dialog import MemoEditDialog
 from .rule_contact_dialog import RuleAndContactDialog
@@ -33,6 +34,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.db = DatabaseManager()
         self.learner = LocalEmailLearner()
+
+        self._active_workers: List[Any] = []
+        self._force_quit: bool = False
+        self._has_shown_tray_bubble: bool = False
 
         self.current_view = "pending"  # "pending", "all_emails", "memos"
         self.selected_email: Optional[Dict[str, Any]] = None
@@ -54,6 +59,31 @@ class MainWindow(QMainWindow):
         self.show()
         self.raise_()
         self.activateWindow()
+
+    def _track_worker(self, worker):
+        """安全持有后台工作线程强引用，避免被 Python GC 提前垃圾回收导致闪退"""
+        if worker not in self._active_workers:
+            self._active_workers.append(worker)
+            worker.finished.connect(lambda: self._untrack_worker(worker))
+        if not worker.isRunning():
+            worker.start()
+
+    def _untrack_worker(self, worker):
+        """线程运行完毕后安全移除强引用"""
+        if worker in self._active_workers:
+            self._active_workers.remove(worker)
+
+    def _minimize_to_tray(self):
+        """隐藏窗口最小化至系统托盘"""
+        self.hide()
+        if not self._has_shown_tray_bubble:
+            self.tray.showMessage(
+                "Coremail 协同助手",
+                "Coremail 协同助手已在后台托盘运行",
+                QSystemTrayIcon.Information,
+                3000
+            )
+            self._has_shown_tray_bubble = True
 
     def _init_ui(self):
         central_widget = QWidget()
@@ -154,6 +184,11 @@ class MainWindow(QMainWindow):
         self.btn_open_settings.clicked.connect(self._open_settings_dialog)
         nav_layout.addWidget(self.btn_open_settings)
 
+        self.btn_minimize_tray = QPushButton("🔽 最小化到托盘")
+        self.btn_minimize_tray.setProperty("class", "nav_util_btn")
+        self.btn_minimize_tray.clicked.connect(self._minimize_to_tray)
+        nav_layout.addWidget(self.btn_minimize_tray)
+
         main_layout.addWidget(nav_panel)
 
         # -------------------------------------------------------------
@@ -189,6 +224,7 @@ class MainWindow(QMainWindow):
         self.item_list = QListWidget()
         self.item_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.item_list.currentItemChanged.connect(self._on_item_selected)
+        self.item_list.itemDoubleClicked.connect(lambda item: self._on_item_selected(item, None))
         mid_layout.addWidget(self.item_list)
 
         self.splitter.addWidget(mid_widget)
@@ -278,8 +314,8 @@ class MainWindow(QMainWindow):
 
     def _setup_tray(self):
         """配置 Windows 任务栏系统托盘与气泡提醒"""
-        from PySide6.QtWidgets import QStyle
         self.tray = QSystemTrayIcon(self)
+        self.tray_icon = self.tray
         icon = self.windowIcon()
         if icon.isNull():
             icon = self.style().standardIcon(QStyle.SP_ComputerIcon)
@@ -287,21 +323,63 @@ class MainWindow(QMainWindow):
         self.tray.setToolTip("CoremailAssistant 论客邮箱智能助手")
 
         tray_menu = QMenu()
-        act_show = QAction("显示主窗口", self)
-        act_show.triggered.connect(self.showNormal)
+        act_show = QAction("📂 打开主窗口", self)
+        act_show.triggered.connect(self.wake_up)
         tray_menu.addAction(act_show)
 
-        act_sync = QAction("立即检查邮件", self)
+        act_sync = QAction("🔄 立即同步邮件", self)
         act_sync.triggered.connect(self._start_manual_sync)
         tray_menu.addAction(act_sync)
 
         tray_menu.addSeparator()
-        act_exit = QAction("退出程序", self)
-        act_exit.triggered.connect(self.close)
+        act_exit = QAction("🚪 彻底退出程序", self)
+        act_exit.triggered.connect(self._exit_application)
         tray_menu.addAction(act_exit)
 
         self.tray.setContextMenu(tray_menu)
+        self.tray.activated.connect(self._on_tray_activated)
         self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            self.wake_up()
+
+    def _exit_application(self):
+        """托盘菜单彻底退出程序"""
+        self._force_quit = True
+        QApplication.quit()
+
+    def changeEvent(self, event):
+        """窗口状态改变事件（最小化时隐藏到托盘）"""
+        if event.type() == QEvent.WindowStateChange and self.isMinimized():
+            self.hide()
+            if not self._has_shown_tray_bubble:
+                self.tray.showMessage(
+                    "Coremail 协同助手",
+                    "Coremail 协同助手已在后台托盘运行",
+                    QSystemTrayIcon.Information,
+                    3000
+                )
+                self._has_shown_tray_bubble = True
+            event.ignore()
+            return
+        super().changeEvent(event)
+
+    def closeEvent(self, event):
+        """关闭窗口事件（未强制退出时拦截并隐藏到托盘）"""
+        if not self._force_quit:
+            event.ignore()
+            self.hide()
+            if not self._has_shown_tray_bubble:
+                self.tray.showMessage(
+                    "Coremail 协同助手",
+                    "Coremail 协同助手已在后台托盘运行",
+                    QSystemTrayIcon.Information,
+                    3000
+                )
+                self._has_shown_tray_bubble = True
+        else:
+            event.accept()
 
     def _setup_timers(self):
         """启动后台定时器：邮件自动轮询与备忘录到期检测"""
@@ -439,13 +517,43 @@ class MainWindow(QMainWindow):
         if self.current_view in ("pending", "all_emails"):
             self.selected_email = data
             self.selected_memo = None
-            if data.get("is_body_loaded", 1) == 0:
-                self._ensure_email_body_loaded(data)
+            has_body = bool(data.get("body_text") or data.get("body_html"))
             self._display_email_detail(data)
+
+            if not has_body or data.get("is_body_loaded", 1) == 0:
+                self.detail_body_view.setHtml(
+                    "<div style='color: #64748B; padding: 24px; text-align: center; font-size: 14px; line-height: 1.8;'>"
+                    "⏳ 正在后台异步加载该邮件正文与附件，请稍候...</div>"
+                )
+                self._load_email_body_async(data)
         elif self.current_view == "memos":
             self.selected_memo = data
             self.selected_email = None
             self._display_memo_detail(data)
+
+    def _load_email_body_async(self, em: Dict[str, Any]):
+        uid = em.get("uid", "")
+        if not uid:
+            return
+        worker = EmailBodyLoadWorker(em, settings=self.db.get_all_settings(), parent=self)
+        worker.body_loaded.connect(self._on_async_body_loaded)
+        worker.load_failed.connect(self._on_async_body_load_failed)
+        self._track_worker(worker)
+
+    def _on_async_body_loaded(self, uid: str, updated_data: dict):
+        if self.selected_email and self.selected_email.get("uid") == uid:
+            self.selected_email.update(updated_data)
+            self._display_email_detail(self.selected_email)
+            self.status_bar.showMessage("✅ 邮件正文与附件加载完成", 3000)
+
+    def _on_async_body_load_failed(self, uid: str, err_msg: str):
+        if self.selected_email and self.selected_email.get("uid") == uid:
+            self.detail_body_view.setHtml(
+                f"<div style='color: #DC2626; padding: 18px; font-size: 13px; line-height: 1.6;'>"
+                f"<b>❌ 邮件正文加载失败：</b><br>{err_msg}<br><br>"
+                f"<span style='color: #64748B;'>建议：请检查服务器连接或重新点击该邮件重试。</span></div>"
+            )
+            self.status_bar.showMessage(f"❌ 正文加载失败: {err_msg}", 5000)
 
     def _display_email_detail(self, em: Dict[str, Any]):
         to_names = ", ".join([f"{x.get('name')}<{x.get('email')}>" for x in em.get("to_list", [])])
@@ -540,7 +648,7 @@ class MainWindow(QMainWindow):
         self.sync_worker.progress_msg.connect(lambda msg: self.status_bar.showMessage(msg))
         self.sync_worker.sync_finished.connect(self._on_sync_finished)
         self.sync_worker.sync_failed.connect(self._on_sync_failed)
-        self.sync_worker.start()
+        self._track_worker(self.sync_worker)
 
     def _on_sync_finished(self, count: int, new_emails: list):
         self.sync_progress.setVisible(False)

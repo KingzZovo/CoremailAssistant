@@ -36,10 +36,11 @@ class DatabaseManager:
 
     def get_connection(self) -> sqlite3.Connection:
         """获取配置了 Row 工厂的 SQLite 连接对象"""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=15.0)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=30.0)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         conn.execute("PRAGMA journal_mode = WAL;")  # 提升并发读写性能
+        conn.execute("PRAGMA synchronous = NORMAL;")
         return conn
 
     def init_db(self) -> None:

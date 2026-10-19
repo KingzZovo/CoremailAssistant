@@ -1,15 +1,15 @@
-"""Global configuration constants, directory paths, and default settings for CoremailAssistant."""
-
 import os
+import shutil
 from pathlib import Path
 
 # 项目根目录
 BASE_DIR = Path(__file__).resolve().parent
 
-# 数据与运行时目录
-DATA_DIR = BASE_DIR / "data"
+# 数据与运行时目录（固定于 Windows 用户标准目录 %LOCALAPPDATA%\CoremailAssistant\data，跨版本升级永久保留）
+appdata_root = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+DATA_DIR = Path(appdata_root) / "CoremailAssistant" / "data"
 ATTACHMENTS_DIR = DATA_DIR / "attachments"
-LOGS_DIR = BASE_DIR / "logs"
+LOGS_DIR = Path(appdata_root) / "CoremailAssistant" / "logs"
 
 # 数据库与本地机器学习模型存储路径
 DATABASE_PATH = str(DATA_DIR / "assistant.db")
@@ -19,6 +19,46 @@ ML_MODELS_PATH = str(DATA_DIR / "ml_models.pkl")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 ATTACHMENTS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# 自动检测并迁移旧版本相对路径下的数据
+def _migrate_legacy_data():
+    legacy_candidates = [
+        BASE_DIR / "data",
+        Path(os.path.abspath("data"))
+    ]
+    target_db = Path(DATABASE_PATH)
+    for leg_dir in legacy_candidates:
+        try:
+            if not leg_dir.exists() or leg_dir.resolve() == DATA_DIR.resolve():
+                continue
+            leg_db = leg_dir / "assistant.db"
+            if leg_db.is_file() and leg_db.stat().st_size > 0:
+                should_copy = False
+                if not target_db.exists() or target_db.stat().st_size == 0:
+                    should_copy = True
+                elif leg_db.stat().st_mtime > target_db.stat().st_mtime or leg_db.stat().st_size > target_db.stat().st_size:
+                    should_copy = True
+                if should_copy:
+                    shutil.copy2(str(leg_db), str(target_db))
+
+            leg_ml = leg_dir / "ml_models.pkl"
+            target_ml = Path(ML_MODELS_PATH)
+            if leg_ml.is_file() and (not target_ml.exists() or leg_ml.stat().st_mtime > target_ml.stat().st_mtime):
+                shutil.copy2(str(leg_ml), str(target_ml))
+
+            leg_att = leg_dir / "attachments"
+            if leg_att.is_dir():
+                for item in leg_att.iterdir():
+                    dst_item = ATTACHMENTS_DIR / item.name
+                    if not dst_item.exists():
+                        if item.is_dir():
+                            shutil.copytree(str(item), str(dst_item))
+                        else:
+                            shutil.copy2(str(item), str(dst_item))
+        except Exception:
+            pass
+
+_migrate_legacy_data()
 
 # 默认系统配置项字典（用于数据库首次初始化或配置回退）
 DEFAULT_SETTINGS = {

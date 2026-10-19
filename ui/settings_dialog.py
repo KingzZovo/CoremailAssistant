@@ -3,14 +3,19 @@ Configures IMAP/SMTP server connection, credentials, polling intervals,
 Machine Learning status & model reset, and local Ollama parameters.
 """
 
+import os
+import zipfile
+from datetime import datetime
 from typing import Dict, Any, Optional
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QCheckBox, QSpinBox, QComboBox, QGroupBox,
-    QMessageBox, QScrollArea, QWidget
+    QMessageBox, QScrollArea, QWidget, QFileDialog
 )
 
+from config import DATA_DIR, DATABASE_PATH
 from core.database import DatabaseManager
 from core.mail_client import CoremailClient, probe_coremail_server_ports
 from core.ml_learner import LocalEmailLearner
@@ -221,10 +226,38 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(ollama_group)
 
+        # 5. 数据存储与备份恢复
+        data_group = QGroupBox("💾 数据存储与备份恢复（跨版本升级永久保留）")
+        data_layout = QVBoxLayout(data_group)
+
+        path_row = QHBoxLayout()
+        path_row.addWidget(QLabel("数据存储路径："))
+        self.data_path_lbl = QLabel(str(DATA_DIR))
+        self.data_path_lbl.setStyleSheet("color: #1E40AF; font-family: monospace; font-weight: bold;")
+        self.data_path_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        path_row.addWidget(self.data_path_lbl, 1)
+
+        btn_open_data_dir = QPushButton("📂 打开数据目录")
+        btn_open_data_dir.clicked.connect(self._open_data_dir)
+        path_row.addWidget(btn_open_data_dir)
+        data_layout.addLayout(path_row)
+
+        backup_row = QHBoxLayout()
+        btn_export_backup = QPushButton("💾 一键导出全部配置与数据备份 (.zip)")
+        btn_export_backup.clicked.connect(self._export_backup)
+        backup_row.addWidget(btn_export_backup)
+
+        btn_import_backup = QPushButton("📥 导入恢复备份 (.zip)")
+        btn_import_backup.clicked.connect(self._import_backup)
+        backup_row.addWidget(btn_import_backup)
+        data_layout.addLayout(backup_row)
+
+        layout.addWidget(data_group)
+
         scroll.setWidget(content_widget)
         main_layout.addWidget(scroll, 1)
 
-        # 5. 底部保存与取消按钮
+        # 6. 底部保存与取消按钮
         bottom_bar = QHBoxLayout()
         bottom_bar.addStretch()
 
@@ -449,3 +482,68 @@ class SettingsDialog(QDialog):
         self.db.update_settings(data)
         QMessageBox.information(self, "保存成功", "系统配置已成功保存！")
         self.accept()
+
+    def _open_data_dir(self):
+        """打开本地数据目录"""
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(DATA_DIR)))
+        except Exception as e:
+            QMessageBox.warning(self, "打开目录失败", f"无法打开数据目录：\n{e}")
+
+    def _export_backup(self):
+        """一键导出全部数据备份为 zip 文件"""
+        default_name = f"CoremailAssistant_Backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "导出数据备份", default_name, "ZIP 压缩包 (*.zip)"
+        )
+        if not file_path:
+            return
+
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with zipfile.ZipFile(file_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(DATA_DIR):
+                    for file in files:
+                        full_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(full_path, DATA_DIR)
+                        zipf.write(full_path, rel_path)
+
+            QMessageBox.information(
+                self, "导出成功", f"全部配置与数据已成功备份至：\n{file_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出备份压缩包失败：\n{e}")
+
+    def _import_backup(self):
+        """从 zip 文件导入恢复数据备份"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择恢复备份文件", "", "ZIP 压缩包 (*.zip)"
+        )
+        if not file_path:
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认恢复备份",
+            "导入备份将覆盖当前本地的数据与配置，是否继续？\n（建议提前备份现有数据）",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            with zipfile.ZipFile(file_path, "r") as zipf:
+                zipf.extractall(DATA_DIR)
+
+            self.db = DatabaseManager()
+            self._load_settings()
+            QMessageBox.information(
+                self,
+                "恢复完成",
+                "数据与配置已成功从备份恢复！\n建议重启应用程序以完全应用数据库变更。",
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "恢复失败", f"导入备份失败：\n{e}")
