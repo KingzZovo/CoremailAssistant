@@ -102,7 +102,7 @@ class MailSyncWorker(QThread):
 
                 # 2. 本地机器学习增量分析 (若未被规则命中且模式允许)
                 if not is_matched and filter_mode in ("rules_and_ml", "ml_only", "ollama_hybrid"):
-                    pred = self.learner.predict_email(em, contacts)
+                    pred = self.learner.predict_email(em, contacts, my_email=settings.get("user", ""))
                     ml_confidence = pred.get("need_action_prob", 0.0)
                     if pred.get("is_ml_recommended", False):
                         is_matched = 1
@@ -254,11 +254,13 @@ class SendMailWorker(QThread):
             # -------------------------------------------------------------
             # 闭环 1: LocalEmailLearner 全文特征增量训练
             # -------------------------------------------------------------
+            my_account = settings.get("email_account", "")
             self.learner.learn_from_user_action(
                 email_data=self.orig_data,
                 action_label=1,
                 chosen_mode=self.mode,
-                chosen_f_emails=self.to_addrs
+                chosen_f_emails=self.to_addrs,
+                my_email=my_account
             )
 
             # -------------------------------------------------------------
@@ -285,7 +287,7 @@ class SendMailWorker(QThread):
                 )
 
             # -------------------------------------------------------------
-            # 闭环 3: 学习联系人 F 的专属称呼习惯与偏好模式
+            # 闭环 3: 学习联系人 F 的专属称呼习惯与发信模式/转发批注/结语习惯
             # -------------------------------------------------------------
             first_line = (self.plain_body.strip().splitlines() or [""])[0]
             sal_match = STRICT_SALUTATION_REGEX.match(first_line)
@@ -307,6 +309,28 @@ class SendMailWorker(QThread):
                         use_salutation=0,
                         preferred_mode=self.mode
                     )
+
+            # 若为新建改写模式，学习末尾礼貌结语
+            if self.mode == "rewrite_new":
+                non_empty_lines = [line.strip() for line in self.plain_body.splitlines() if line.strip()]
+                if len(non_empty_lines) >= 2:
+                    last_line = non_empty_lines[-1]
+                    if len(last_line) <= 30 and any(kw in last_line for kw in ("谢谢", "请", "落实", "辛苦", "跟进", "反馈", "查收", "确认", "祝", "敬礼")):
+                        self.db.save_setting("default_closing_sign", last_line)
+
+            # 若为标准带引文转发模式，学习转发批注模板（泛化 {sender_name}）
+            elif self.mode == "standard_forward":
+                if "------------------ 原始邮件 ------------------" in self.plain_body:
+                    top_part = self.plain_body.split("------------------ 原始邮件 ------------------")[0].strip()
+                    lines = [line.strip() for line in top_part.splitlines() if line.strip()]
+                    if lines and STRICT_SALUTATION_REGEX.match(lines[0]):
+                        lines = lines[1:]
+                    if lines:
+                        note_text = "\n".join(lines)
+                        if sender_name and sender_name in note_text:
+                            note_text = note_text.replace(sender_name, "{sender_name}")
+                        if len(note_text) <= 120:
+                            self.db.save_setting("forward_note_template", note_text)
 
             # -------------------------------------------------------------
             # 闭环 4: 记录样本与更新邮件状态

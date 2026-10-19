@@ -71,6 +71,11 @@ class LocalEmailLearner:
         # 3. 发件人 & 全文词组 -> 目标收件人 F 的权重统计矩阵 (纯 Python 统计，永远安全)
         self.sender_to_target_stats: Dict[str, Dict[str, float]] = {}
         self.token_to_target_stats: Dict[str, Dict[str, float]] = {}
+
+        # 4. 细粒度转发习惯记忆矩阵（引文 vs 不引文）
+        self.pair_mode_stats: Dict[str, Dict[str, int]] = {}
+        self.sender_mode_stats: Dict[str, Dict[str, int]] = {}
+        self.folder_mode_stats: Dict[str, Dict[str, int]] = {}
         self._load()
 
     @staticmethod
@@ -91,26 +96,76 @@ class LocalEmailLearner:
         return words + bigrams
 
     @staticmethod
-    def _build_full_feature_text(sender_email: str, cc_list: List[Dict[str, str]], subject: str, full_body: str) -> str:
-        """融合发件人、原抄送人特征、主题与整封邮件全文（不截断）"""
-        sender_tag = f"__from_{sender_email.lower().strip()}__"
-        cc_tags = " ".join([f"__cc_{c.get('email', '').lower().strip()}__" for c in (cc_list or [])])
-        return f"{sender_tag} {sender_tag} {cc_tags} {subject} {subject} {full_body or ''}"
+    def _build_full_feature_text(
+        sender_email: str,
+        cc_list: List[Dict[str, str]],
+        subject: str,
+        full_body: str,
+        folder_name: str = "",
+        to_list: Optional[List[Dict[str, str]]] = None,
+        attachments: Optional[List[Any]] = None,
+        my_email: str = ""
+    ) -> str:
+        """
+        全方位特征融合：
+        - 权重强化发件人特征: __from_{sender_email}__ (x3)
+        - 权重强化所属文件夹特征: __folder_{folder_name}__ (x2)
+        - 我是否在 To 或 CC: __me_in_to__ / __me_in_cc__
+        - 附件特征: __has_attach__
+        - 主题与邮件全文 (不截断)
+        """
+        sender_clean = sender_email.lower().strip()
+        sender_tag = f"__from_{sender_clean}__" if sender_clean else ""
+        folder_clean = folder_name.strip()
+        folder_tag = f"__folder_{folder_clean}__" if folder_clean else ""
+
+        tags = []
+        if sender_tag:
+            tags.extend([sender_tag, sender_tag, sender_tag])
+        if folder_tag:
+            tags.extend([folder_tag, folder_tag])
+
+        my_clean = my_email.lower().strip()
+        if my_clean:
+            in_to = any(my_clean in str(t.get("email", "")).lower() for t in (to_list or []))
+            in_cc = any(my_clean in str(c.get("email", "")).lower() for c in (cc_list or []))
+            if in_to:
+                tags.append("__me_in_to__")
+            if in_cc:
+                tags.append("__me_in_cc__")
+
+        if attachments:
+            tags.append("__has_attach__")
+
+        for c in (cc_list or []):
+            ce = str(c.get("email", "")).lower().strip()
+            if ce:
+                tags.append(f"__cc_{ce}__")
+
+        tag_str = " ".join(tags)
+        return f"{tag_str} {subject} {subject} {full_body or ''}"
 
     def predict_email(
         self,
         email_data: Dict[str, Any],
-        candidate_contacts: Optional[List[Dict[str, Any]]] = None
+        candidate_contacts: Optional[List[Dict[str, Any]]] = None,
+        my_email: str = ""
     ) -> Dict[str, Any]:
         """基于邮件全文预测：是否需流转、推荐新建还是转发、推荐收件人 F"""
         if candidate_contacts is None:
             candidate_contacts = []
         sender = (email_data.get("sender_email") or "").lower().strip()
         cc_list = email_data.get("cc_list") or []
+        to_list = email_data.get("to_list") or []
         subject = email_data.get("subject") or ""
         full_body = email_data.get("body_text") or ""
+        folder_name = email_data.get("folder_name") or ""
+        attachments = email_data.get("attachments") or []
 
-        feat_text = self._build_full_feature_text(sender, cc_list, subject, full_body)
+        feat_text = self._build_full_feature_text(
+            sender, cc_list, subject, full_body,
+            folder_name=folder_name, to_list=to_list, attachments=attachments, my_email=my_email
+        )
 
         need_prob = 0.5
         if self.vectorizer and self.action_clf and self.action_fitted:
@@ -120,15 +175,7 @@ class LocalEmailLearner:
             except Exception:
                 need_prob = 0.5
 
-        rec_mode = "rewrite_new"
-        if self.vectorizer and self.mode_clf and self.mode_fitted:
-            try:
-                X = self.vectorizer.transform([feat_text])
-                m_prob = float(self.mode_clf.predict_proba(X)[0][1])
-                rec_mode = "rewrite_new" if m_prob >= 0.5 else "standard_forward"
-            except Exception:
-                rec_mode = "rewrite_new"
-
+        # 计算收件人 F 得分
         scores: Dict[str, float] = {}
         valid_emails = {c["email"].lower(): c["email"] for c in candidate_contacts if c.get("email")}
 
@@ -137,7 +184,6 @@ class LocalEmailLearner:
                 if f_mail in valid_emails:
                     scores[valid_emails[f_mail]] = scores.get(valid_emails[f_mail], 0.0) + weight * 3.0
 
-        # 扫描整封邮件全文的词与双词短语计算收件人 F 匹配得分
         full_tokens = set(self._fulltext_ngram_analyzer(f"{subject} {full_body}"))
         for tk in full_tokens:
             if tk in self.token_to_target_stats:
@@ -146,9 +192,47 @@ class LocalEmailLearner:
                         scores[valid_emails[f_mail]] = scores.get(valid_emails[f_mail], 0.0) + weight * 0.4
 
         ranked_f = sorted(scores.keys(), key=lambda k: scores[k], reverse=True)
+        top_f = ranked_f[0].lower().strip() if ranked_f else ""
+
+        # 模式推荐：优先 (sender, top_f) 习惯 -> 其次 sender 习惯 -> 其次 folder 习惯 -> 模式分类器
+        rec_mode = None
+        if sender and top_f:
+            pair_key = f"{sender}::{top_f}"
+            if pair_key in self.pair_mode_stats:
+                p_stats = self.pair_mode_stats[pair_key]
+                if p_stats.get("rewrite_new", 0) > p_stats.get("standard_forward", 0):
+                    rec_mode = "rewrite_new"
+                elif p_stats.get("standard_forward", 0) > p_stats.get("rewrite_new", 0):
+                    rec_mode = "standard_forward"
+
+        if not rec_mode and sender and sender in self.sender_mode_stats:
+            s_stats = self.sender_mode_stats[sender]
+            if s_stats.get("rewrite_new", 0) > s_stats.get("standard_forward", 0):
+                rec_mode = "rewrite_new"
+            elif s_stats.get("standard_forward", 0) > s_stats.get("rewrite_new", 0):
+                rec_mode = "standard_forward"
+
+        if not rec_mode and folder_name and folder_name in self.folder_mode_stats:
+            f_stats = self.folder_mode_stats[folder_name]
+            if f_stats.get("rewrite_new", 0) > f_stats.get("standard_forward", 0):
+                rec_mode = "rewrite_new"
+            elif f_stats.get("standard_forward", 0) > f_stats.get("rewrite_new", 0):
+                rec_mode = "standard_forward"
+
+        if not rec_mode:
+            if self.vectorizer and self.mode_clf and self.mode_fitted:
+                try:
+                    X = self.vectorizer.transform([feat_text])
+                    m_prob = float(self.mode_clf.predict_proba(X)[0][1])
+                    rec_mode = "rewrite_new" if m_prob >= 0.5 else "standard_forward"
+                except Exception:
+                    rec_mode = "rewrite_new"
+            else:
+                rec_mode = "rewrite_new"
+
         return {
             "need_action_prob": round(need_prob, 3),
-            "is_ml_recommended": need_prob >= 0.58,
+            "is_ml_recommended": need_prob >= 0.55,
             "recommended_mode": rec_mode,
             "predicted_f_emails": ranked_f[:2]
         }
@@ -158,15 +242,22 @@ class LocalEmailLearner:
         email_data: Dict[str, Any],
         action_label: int,
         chosen_mode: str = "rewrite_new",
-        chosen_f_emails: Optional[List[str]] = None
+        chosen_f_emails: Optional[List[str]] = None,
+        my_email: str = ""
     ) -> None:
         """从用户对整封邮件的实际操作中进行全文特征增量训练"""
         sender = (email_data.get("sender_email") or "").lower().strip()
         cc_list = email_data.get("cc_list") or []
+        to_list = email_data.get("to_list") or []
         subject = email_data.get("subject") or ""
         full_body = email_data.get("body_text") or ""
+        folder_name = email_data.get("folder_name") or ""
+        attachments = email_data.get("attachments") or []
 
-        feat_text = self._build_full_feature_text(sender, cc_list, subject, full_body)
+        feat_text = self._build_full_feature_text(
+            sender, cc_list, subject, full_body,
+            folder_name=folder_name, to_list=to_list, attachments=attachments, my_email=my_email
+        )
         if self.vectorizer and self.action_clf and np is not None:
             try:
                 X = self.vectorizer.transform([feat_text])
@@ -190,9 +281,22 @@ class LocalEmailLearner:
                 if sender:
                     self.sender_to_target_stats.setdefault(sender, {})
                     self.sender_to_target_stats[sender][f_clean] = self.sender_to_target_stats[sender].get(f_clean, 0.0) + 1.0
+
+                    pair_key = f"{sender}::{f_clean}"
+                    self.pair_mode_stats.setdefault(pair_key, {"rewrite_new": 0, "standard_forward": 0})
+                    self.pair_mode_stats[pair_key][chosen_mode] = self.pair_mode_stats[pair_key].get(chosen_mode, 0) + 1
+
                 for tk in full_tokens:
                     self.token_to_target_stats.setdefault(tk, {})
                     self.token_to_target_stats[tk][f_clean] = self.token_to_target_stats[tk].get(f_clean, 0.0) + 1.0
+
+            if sender:
+                self.sender_mode_stats.setdefault(sender, {"rewrite_new": 0, "standard_forward": 0})
+                self.sender_mode_stats[sender][chosen_mode] = self.sender_mode_stats[sender].get(chosen_mode, 0) + 1
+
+            if folder_name:
+                self.folder_mode_stats.setdefault(folder_name, {"rewrite_new": 0, "standard_forward": 0})
+                self.folder_mode_stats[folder_name][chosen_mode] = self.folder_mode_stats[folder_name].get(chosen_mode, 0) + 1
 
         self._save()
 
@@ -262,6 +366,9 @@ class LocalEmailLearner:
         self.mode_fitted = False
         self.sender_to_target_stats = {}
         self.token_to_target_stats = {}
+        self.pair_mode_stats = {}
+        self.sender_mode_stats = {}
+        self.folder_mode_stats = {}
         if os.path.exists(self.model_path):
             try:
                 os.remove(self.model_path)
@@ -280,7 +387,10 @@ class LocalEmailLearner:
                 "mode_clf": self.mode_clf,
                 "mode_fitted": self.mode_fitted,
                 "sender_stats": self.sender_to_target_stats,
-                "token_stats": self.token_to_target_stats
+                "token_stats": self.token_to_target_stats,
+                "pair_mode_stats": self.pair_mode_stats,
+                "sender_mode_stats": self.sender_mode_stats,
+                "folder_mode_stats": self.folder_mode_stats,
             }, self.model_path)
         except Exception:
             pass
@@ -299,5 +409,9 @@ class LocalEmailLearner:
             self.mode_fitted = data.get("mode_fitted", False)
             self.sender_to_target_stats = data.get("sender_stats", {})
             self.token_to_target_stats = data.get("token_stats", {})
+            self.pair_mode_stats = data.get("pair_mode_stats", {})
+            self.sender_mode_stats = data.get("sender_mode_stats", {})
+            self.folder_mode_stats = data.get("folder_mode_stats", {})
         except Exception:
             pass
+

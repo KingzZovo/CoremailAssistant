@@ -5,11 +5,79 @@ Encapsulates thread-safe connection management and complete CRUD operations for 
 import json
 import sqlite3
 import threading
+import time
+import email.utils
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import DATABASE_PATH, DEFAULT_SETTINGS
+
+
+def parse_email_date_to_timestamp(raw_date: Any) -> Tuple[int, str]:
+    """
+    通用解析邮件日期为 (unix_timestamp_seconds, "YYYY-MM-DD HH:MM")
+    兼容毫秒时间戳 (13位)、秒级时间戳 (10位)、ISO 日期字符串、RFC2822 邮件头日期等
+    """
+    if not raw_date:
+        now_ts = int(time.time())
+        return now_ts, datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M")
+
+    # 1. 数字类型或纯数字字符串
+    if isinstance(raw_date, (int, float)):
+        ts = float(raw_date)
+        if ts > 1e11:  # 毫秒时间戳 (13位)
+            ts = ts / 1000.0
+        sec = max(0, int(ts))
+        try:
+            dt_str = datetime.fromtimestamp(sec).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            dt_str = ""
+        return sec, dt_str
+
+    s = str(raw_date).strip()
+    if not s:
+        now_ts = int(time.time())
+        return now_ts, datetime.fromtimestamp(now_ts).strftime("%Y-%m-%d %H:%M")
+
+    # 检查纯数字字符串
+    if s.isdigit():
+        num = int(s)
+        if num > 1e11:
+            num = int(num / 1000)
+        try:
+            dt_str = datetime.fromtimestamp(num).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            dt_str = ""
+        return num, dt_str
+
+    # 2. RFC2822 邮件头格式 (如 Mon, 19 Oct 2026 14:30:00 +0800)
+    try:
+        dt = email.utils.parsedate_to_datetime(s)
+        if dt:
+            sec = int(dt.timestamp())
+            return sec, dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        pass
+
+    # 3. ISO 或常规格式 YYYY-MM-DD HH:MM:SS 或 YYYY-MM-DDTHH:MM:SS
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+        "%Y/%m/%d %H:%M:%S",
+        "%Y/%m/%d %H:%M",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ):
+        try:
+            dt = datetime.strptime(s, fmt)
+            sec = int(dt.timestamp())
+            return sec, dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+
+    now_ts = int(time.time())
+    return now_ts, s
 
 
 class DatabaseManager:
@@ -60,6 +128,7 @@ class DatabaseManager:
                 to_list_json TEXT NOT NULL,
                 cc_list_json TEXT NOT NULL,
                 date_str TEXT,
+                received_timestamp INTEGER DEFAULT 0,
                 body_text TEXT,
                 body_html TEXT,
                 attachments_json TEXT DEFAULT '[]',
@@ -78,13 +147,38 @@ class DatabaseManager:
             );
             """)
 
-            # 字段自动平滑升级（若旧库不存在这两个字段则动态添加）
+            # 字段自动平滑升级（若旧库不存在这几个字段则动态添加）
             cursor.execute("PRAGMA table_info(emails);")
             existing_cols = {row["name"] for row in cursor.fetchall()}
             if "folder_name" not in existing_cols:
                 cursor.execute("ALTER TABLE emails ADD COLUMN folder_name TEXT DEFAULT '收件箱';")
             if "is_body_loaded" not in existing_cols:
                 cursor.execute("ALTER TABLE emails ADD COLUMN is_body_loaded INTEGER DEFAULT 1;")
+            if "received_timestamp" not in existing_cols:
+                cursor.execute("ALTER TABLE emails ADD COLUMN received_timestamp INTEGER DEFAULT 0;")
+
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_emails_received_ts ON emails(received_timestamp DESC, id DESC);")
+
+            # 启动时自动清洗被 Coremail 网盘文件下载网页源码污染的历史邮件正文
+            cursor.execute("""
+            UPDATE emails
+            SET body_text = '', body_html = '', is_body_loaded = 0
+            WHERE body_text LIKE '%网盘文件下载%'
+               OR body_html LIKE '%网盘文件下载%'
+               OR body_text LIKE '%/coremail/bundle/%'
+               OR body_html LIKE '%/coremail/bundle/%'
+               OR body_text LIKE '<!DOCTYPE html%';
+            """)
+
+            # 存量历史邮件时间戳与格式化时间自动回填升级
+            cursor.execute("SELECT id, date_str FROM emails WHERE received_timestamp IS NULL OR received_timestamp = 0;")
+            rows_to_fix = cursor.fetchall()
+            for r in rows_to_fix:
+                ts, std_d = parse_email_date_to_timestamp(r["date_str"])
+                cursor.execute(
+                    "UPDATE emails SET received_timestamp = ?, date_str = ? WHERE id = ?;",
+                    (ts, std_d, r["id"])
+                )
 
             # 2. 全功能自定义备忘录表
             cursor.execute("""
@@ -305,15 +399,19 @@ class DatabaseManager:
                 else email_data.get("suggested_to", "[]")
             )
 
+            raw_date = email_data.get("received_timestamp") or email_data.get("date_str")
+            rec_ts, norm_date_str = parse_email_date_to_timestamp(raw_date)
+            final_date_str = email_data.get("date_str") or norm_date_str
+
             cursor.execute(
                 """
                 INSERT OR IGNORE INTO emails (
                     uid, message_id, subject, sender_name, sender_email,
-                    to_list_json, cc_list_json, date_str, body_text, body_html,
+                    to_list_json, cc_list_json, date_str, received_timestamp, body_text, body_html,
                     attachments_json, is_matched, ml_confidence, matched_rule_name,
                     recommended_mode, ai_summary, ai_urgency, suggested_to_json, status,
                     folder_name, is_body_loaded
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     str(email_data.get("uid", "")),
@@ -323,7 +421,8 @@ class DatabaseManager:
                     email_data.get("sender_email", ""),
                     to_json,
                     cc_json,
-                    email_data.get("date_str", ""),
+                    final_date_str,
+                    rec_ts,
                     email_data.get("body_text", ""),
                     email_data.get("body_html", ""),
                     attach_json,
@@ -366,8 +465,9 @@ class DatabaseManager:
         status_filter: Optional[str] = None,
         is_matched_only: bool = False,
         keyword: Optional[str] = None,
+        folder_filter: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        """条件检索邮件列表"""
+        """条件检索邮件列表（严格按收信时间从新到旧排序）"""
         with self._op_lock, self.get_connection() as conn:
             cursor = conn.cursor()
             clauses = []
@@ -378,13 +478,16 @@ class DatabaseManager:
                 params.append(status_filter)
             if is_matched_only:
                 clauses.append("is_matched = 1")
+            if folder_filter and folder_filter.strip() and folder_filter.strip() not in ("all", "全部文件夹", "全部"):
+                clauses.append("folder_name = ?")
+                params.append(folder_filter.strip())
             if keyword:
                 clauses.append("(subject LIKE ? OR sender_name LIKE ? OR sender_email LIKE ? OR body_text LIKE ?)")
                 pat = f"%{keyword}%"
                 params.extend([pat, pat, pat, pat])
 
             where_str = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-            sql = f"SELECT * FROM emails {where_str} ORDER BY id DESC LIMIT ?;"
+            sql = f"SELECT * FROM emails {where_str} ORDER BY received_timestamp DESC, id DESC LIMIT ?;"
             params.append(limit)
 
             cursor.execute(sql, params)
@@ -400,6 +503,35 @@ class DatabaseManager:
                     pass
                 results.append(d)
             return results
+
+    def get_folder_counts(self) -> List[Dict[str, Any]]:
+        """获取按文件夹分组的邮件统计数量"""
+        with self._op_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT folder_name, COUNT(*) as count FROM emails GROUP BY folder_name ORDER BY count DESC;"
+            )
+            return [{"folder_name": row["folder_name"] or "收件箱", "count": row["count"]} for row in cursor.fetchall()]
+
+    def mark_email_need_action(self, uid: str) -> None:
+        """标记邮件为待流转协同 (is_matched = 1, status = 'pending')"""
+        with self._op_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE emails SET is_matched = 1, status = 'pending' WHERE uid = ?;",
+                (str(uid),)
+            )
+            conn.commit()
+
+    def mark_email_no_action(self, uid: str) -> None:
+        """标记邮件为无需流转 (is_matched = 0, status = 'ignored')"""
+        with self._op_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE emails SET is_matched = 0, status = 'ignored' WHERE uid = ?;",
+                (str(uid),)
+            )
+            conn.commit()
 
     def get_pending_emails(self, limit: int = 100) -> List[Dict[str, Any]]:
         """获取所有待流转/待处理的邮件 (is_matched = 1 且 status = 'pending')"""
@@ -1149,4 +1281,10 @@ class DatabaseManager:
     create_or_update_memo = create_memo
     get_all_memos = get_memos
     list_memos = get_memos
+
+
+__all__ = [
+    "DatabaseManager",
+    "parse_email_date_to_timestamp",
+]
 

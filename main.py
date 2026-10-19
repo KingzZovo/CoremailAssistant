@@ -51,6 +51,18 @@ def main():
     # 预初始化本地 SQLite 数据库与默认配置
     DatabaseManager()
 
+    # 提前在主线程预热加载 jieba 词典与机器学习引擎（防止子线程冷启动大词典引发 Windows 栈溢出崩溃）
+    try:
+        import jieba
+        jieba.initialize()
+    except Exception:
+        pass
+    try:
+        from core.ml_learner import LocalEmailLearner
+        LocalEmailLearner()
+    except Exception:
+        pass
+
     # 启动主窗口
     window = MainWindow()
     window.show()

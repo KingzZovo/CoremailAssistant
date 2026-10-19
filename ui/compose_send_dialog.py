@@ -312,12 +312,16 @@ class ComposeAndSendDialog(QDialog):
         selected_f = self._get_selected_f_emails()
         target_contacts = [c for c in self.contacts if c.get("email", "").lower() in [f.lower() for f in selected_f]]
 
+        closing = self.settings.get("default_closing_sign") or "请协助跟进处理，谢谢！"
+        fwd_tmpl = self.settings.get("forward_note_template") or ""
         content = RewriterEngine.build_compose_content(
             mode=mode,
             email_data=self.email_data,
             target_contacts=target_contacts,
             selected_f_emails=selected_f,
-            custom_rewrite_rules=self.custom_rules
+            custom_rewrite_rules=self.custom_rules,
+            closing_sign=closing,
+            custom_forward_template=fwd_tmpl
         )
 
         self.subject_edit.setText(content["subject"])

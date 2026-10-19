@@ -27,6 +27,12 @@ import requests
 import urllib3
 
 from config import ATTACHMENTS_DIR
+from core.database import parse_email_date_to_timestamp
+
+try:
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
 
 # 忽略内网自签名证书安全警告
 urllib3.disable_warnings()
@@ -162,6 +168,69 @@ def is_system_non_inbox_folder(folder_id: Any, folder_name: str) -> bool:
     return any(k in lower for k in exclude_keywords)
 
 
+def _is_polluted_coremail_shell(text: str) -> bool:
+    """
+    判断文本是否为 Coremail 网盘文件下载 / Web 页面前端外壳而非真实邮件内容
+    """
+    if not text:
+        return False
+    lower = text.lower()
+    polluted_markers = [
+        "<title>网盘文件下载</title>",
+        "网盘文件下载",
+        "id=jskin",
+        'id="jskin"',
+        "/coremail/bundle/polyfill",
+        "/coremail/bundle/",
+        "var $, _ x =",
+        "var $, _ x",
+        "window.coremail",
+        "x.a3565",
+    ]
+    if any(m in lower for m in polluted_markers):
+        return True
+    if lower.strip().startswith("<!doctype html") and "<title>" in lower and "coremail" in lower:
+        return True
+    return False
+
+
+def _clean_and_extract_html_and_text(raw_html: str) -> Tuple[str, str]:
+    """
+    净化 HTML 正文并提取纯文本：
+    用 BeautifulSoup 剥离 script, style, link, meta, title, noscript 标签，
+    提取 clean_text 与 clean_html
+    """
+    if not raw_html or _is_polluted_coremail_shell(raw_html):
+        return "", ""
+
+    if BeautifulSoup is not None:
+        try:
+            soup = BeautifulSoup(raw_html, "html.parser")
+            for tag in soup(["script", "style", "link", "meta", "title", "noscript"]):
+                tag.decompose()
+
+            body_tag = soup.body if soup.body else soup
+            clean_html = "".join(str(c) for c in body_tag.contents).strip() if body_tag else str(soup)
+
+            # 为块级标签追加换行，保证段落自然换行且不拆散行内元素(如 span/b/font)
+            for block in soup.find_all(["p", "br", "div", "tr", "h1", "h2", "h3", "h4", "h5", "h6", "li"]):
+                block.append("\n")
+            clean_text = "\n".join(line.strip() for line in soup.get_text().splitlines() if line.strip())
+            return clean_text, clean_html
+        except Exception:
+            pass
+
+    # 正则降级处理
+    clean = re.sub(r"<style[\s\S]*?</style>", "", raw_html, flags=re.I)
+    clean = re.sub(r"<script[\s\S]*?</script>", "", clean, flags=re.I)
+    clean = re.sub(r"<link[\s\S]*?>", "", clean, flags=re.I)
+    clean = re.sub(r"<meta[\s\S]*?>", "", clean, flags=re.I)
+    clean = re.sub(r"<title[\s\S]*?</title>", "", clean, flags=re.I)
+    clean_text = re.sub(r"<[^>]+>", " ", clean)
+    clean_text = re.sub(r"\s+", " ", clean_text).strip()
+    return clean_text, clean
+
+
 def _extract_body_from_coremail_json(var_data: Any) -> Tuple[str, str]:
     """
     通用提取 Coremail WebAPI (mbox:readMessage / mbox:getMessageData / mbox:getMessageInfos)
@@ -207,15 +276,30 @@ def _extract_body_from_coremail_json(var_data: Any) -> Tuple[str, str]:
             elif "plain" in p_type and not body_text:
                 body_text = p_content
 
-    # 如果有 html 但没有 text，通过正则清洗 html 标签作为 text
-    if not body_text and body_html:
-        clean = re.sub(r"<style[\s\S]*?</style>", "", body_html, flags=re.I)
-        clean = re.sub(r"<script[\s\S]*?</script>", "", clean, flags=re.I)
-        clean = re.sub(r"<[^>]+>", " ", clean)
-        clean = re.sub(r"\s+", " ", clean).strip()
-        body_text = clean
+    # 过滤污染的 Coremail 网盘外壳
+    if _is_polluted_coremail_shell(body_html):
+        body_html = ""
+    if _is_polluted_coremail_shell(body_text):
+        body_text = ""
+
+    # 清洗 HTML 标签并同步提取纯文本
+    if body_html:
+        c_text, c_html = _clean_and_extract_html_and_text(body_html)
+        if c_html:
+            body_html = c_html
+        if not body_text and c_text:
+            body_text = c_text
+    elif body_text:
+        # 如果 text 自身包含 HTML 标签，尝试解析
+        if "<" in body_text and ">" in body_text:
+            c_text, c_html = _clean_and_extract_html_and_text(body_text)
+            if c_html:
+                body_html = c_html
+            if c_text:
+                body_text = c_text
 
     return body_text, body_html
+
 
 
 def probe_coremail_server_ports(raw_host: str) -> Dict[str, Any]:
@@ -609,7 +693,8 @@ class CoremailClient:
                         continue
 
                     subject = decode_mime_str(item.get("subject", "(无主题)"))
-                    date_str = str(item.get("sentDate") or item.get("receivedDate") or "")
+                    raw_date = item.get("receivedDate") or item.get("sentDate") or item.get("date") or ""
+                    rec_ts, std_date_str = parse_email_date_to_timestamp(raw_date)
 
                     raw_from = item.get("from") or ""
                     from_list = parse_address_list([raw_from]) if raw_from else []
@@ -632,7 +717,8 @@ class CoremailClient:
                         "sender_email": sender_email,
                         "to_list": to_list,
                         "cc_list": cc_list,
-                        "date_str": date_str,
+                        "date_str": std_date_str,
+                        "received_timestamp": rec_ts,
                         "folder_name": fname,
                         "folder_id": fid,
                         "body_text": summary,
@@ -653,7 +739,7 @@ class CoremailClient:
     def fetch_single_email_detail(self, uid: str, folder_name: str = "INBOX") -> Dict[str, Any]:
         """
         按需单独拉取某一封邮件的完整正文 (HTML/Text) 并下载附件至本地磁盘 (Lazy-Load)
-        优先通过 /coremail/s/eml 原文下载，次选 mbox:readMessage/getMessageData JSON 模式，或回退 IMAP
+        优先通过 mbox:readMessage 获取结构化正文，次选 mbox:getMessageData 流接口，或回退 IMAP
         """
         # 1. WebAPI 模式
         if self.protocol_mode == "coremail":
@@ -662,81 +748,165 @@ class CoremailClient:
                 session = self._get_http_session()
                 raw_mid = uid.split("::")[-1] if "::" in str(uid) else str(uid)
 
-                # 方式 A：优先 EML 方式拉取原始数据（100% 完整解析富文本与附件）
-                for eml_url in [
-                    f"{base_url}/coremail/s/eml?sid={sid}&mid={quote(raw_mid)}",
-                    f"{base_url}/coremail/XT5/jsp/download.jsp?sid={sid}&mid={quote(raw_mid)}"
-                ]:
-                    try:
-                        eml_resp = session.get(eml_url, timeout=15.0)
-                        if eml_resp.status_code == 200 and eml_resp.content and len(eml_resp.content) > 10:
-                            parsed = self._parse_raw_email(str(uid), eml_resp.content)
-                            if parsed and (parsed.get("body_text") or parsed.get("body_html") or parsed.get("attachments")):
-                                return {
-                                    "subject": parsed.get("subject", ""),
-                                    "sender_name": parsed.get("sender_name", ""),
-                                    "sender_email": parsed.get("sender_email", ""),
-                                    "to_list": parsed.get("to_list", []),
-                                    "cc_list": parsed.get("cc_list", []),
-                                    "date_str": parsed.get("date_str", ""),
-                                    "body_text": parsed.get("body_text", ""),
-                                    "body_html": parsed.get("body_html", ""),
-                                    "attachments": parsed.get("attachments", []),
-                                    "is_body_loaded": 1
-                                }
-                    except Exception:
-                        continue
+                body_text = ""
+                body_html = ""
+                attachments = []
+                m_var = {}
 
-                # 方式 B：mbox:readMessage / mbox:getMessageData / mbox:getMessageInfos JSON 回退解析
-                for func_name in ["mbox:readMessage", "mbox:getMessageData", "mbox:getMessageInfos"]:
-                    try:
-                        read_url = f"{base_url}/coremail/s/json?sid={sid}&func={func_name}"
-                        read_resp = session.post(
-                            read_url,
-                            json={"mid": raw_mid, "mode": "html", "markRead": False},
-                            timeout=15.0
-                        )
-                        if read_resp.status_code == 200:
-                            rdata = read_resp.json()
-                            if rdata.get("code") == "S_OK":
-                                m_var = rdata.get("var", {})
-                                body_text, body_html = _extract_body_from_coremail_json(m_var)
+                # =============================================================
+                # 第 1 步：调用标准 JSON 读信接口 mbox:readMessage
+                # =============================================================
+                try:
+                    read_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:readMessage"
+                    read_resp = session.post(
+                        read_url,
+                        json={
+                            "mid": raw_mid,
+                            "mode": "html",
+                            "markRead": False,
+                            "returnImageInfo": True,
+                            "filterStylesheets": False
+                        },
+                        timeout=15.0
+                    )
+                    if read_resp.status_code == 200:
+                        rdata = read_resp.json()
+                        if rdata.get("code") == "S_OK":
+                            m_var = rdata.get("var", {})
+                            body_text, body_html = _extract_body_from_coremail_json(m_var)
 
-                                attachments = []
-                                raw_atts = m_var.get("attachments") or []
-                                if raw_atts:
-                                    uid_attach_dir = os.path.join(self.attachment_root, re.sub(r'[\\/:*?"<>|]', "_", str(uid)))
-                                    os.makedirs(uid_attach_dir, exist_ok=True)
-                                    for att in raw_atts:
-                                        aid = att.get("id") or att.get("aid")
-                                        att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
-                                        safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
-                                        att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
-
-                                        if aid is not None:
-                                            att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(raw_mid)}&aid={aid}"
+                            # 检查 parts 或 attachments：如果正文为空但某个 part 是 html/plain
+                            if not body_html and not body_text:
+                                parts = m_var.get("parts") or m_var.get("attachments") or []
+                                for part in parts:
+                                    if not isinstance(part, dict):
+                                        continue
+                                    p_ctype = str(part.get("contentType") or part.get("type") or "").lower()
+                                    if "html" in p_ctype or "plain" in p_ctype:
+                                        p_content = part.get("content") or part.get("body")
+                                        if p_content and not _is_polluted_coremail_shell(p_content):
+                                            if "html" in p_ctype:
+                                                body_html = p_content
+                                            else:
+                                                body_text = p_content
+                                            break
+                                        part_id = part.get("id") or part.get("partId")
+                                        if part_id is not None:
                                             try:
-                                                att_resp = session.get(att_url, timeout=20.0)
-                                                if att_resp.status_code == 200:
-                                                    with open(att_path, "wb") as af:
-                                                        af.write(att_resp.content)
-                                                    attachments.append({
-                                                        "filename": safe_fname,
-                                                        "filepath": att_path,
-                                                        "size": len(att_resp.content)
-                                                    })
+                                                part_url = f"{base_url}/coremail/s?func=mbox:getMessageData&sid={sid}&mid={quote(raw_mid)}&part={part_id}&mode=html"
+                                                part_resp = session.get(part_url, timeout=15.0)
+                                                if part_resp.status_code == 200 and part_resp.text:
+                                                    if not _is_polluted_coremail_shell(part_resp.text):
+                                                        body_text, body_html = _clean_and_extract_html_and_text(part_resp.text)
+                                                        if body_html or body_text:
+                                                            break
                                             except Exception:
                                                 pass
 
-                                if body_text or body_html or attachments:
-                                    return {
-                                        "body_text": body_text,
-                                        "body_html": body_html,
-                                        "attachments": attachments,
-                                        "is_body_loaded": 1
-                                    }
-                    except Exception:
-                        continue
+                            # 附件下载
+                            raw_atts = m_var.get("attachments") or []
+                            if raw_atts:
+                                uid_attach_dir = os.path.join(self.attachment_root, re.sub(r'[\\/:*?"<>|]', "_", str(uid)))
+                                os.makedirs(uid_attach_dir, exist_ok=True)
+                                for att in raw_atts:
+                                    aid = att.get("id") or att.get("aid")
+                                    att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
+                                    safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
+                                    att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
+
+                                    if aid is not None:
+                                        att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(raw_mid)}&aid={aid}"
+                                        try:
+                                            att_resp = session.get(att_url, timeout=20.0)
+                                            if att_resp.status_code == 200:
+                                                with open(att_path, "wb") as af:
+                                                    af.write(att_resp.content)
+                                                attachments.append({
+                                                    "filename": safe_fname,
+                                                    "filepath": att_path,
+                                                    "size": len(att_resp.content)
+                                                })
+                                        except Exception:
+                                            pass
+                except Exception:
+                    pass
+
+                parsed_eml_info = {}
+                # =============================================================
+                # 第 2 步：若第 1 步正文仍为空，调用 mbox:getMessageData 整信流接口
+                # =============================================================
+                if not body_html and not body_text:
+                    for mode_arg in ("html", "text", "eml"):
+                        try:
+                            stream_url = f"{base_url}/coremail/s?func=mbox:getMessageData&sid={sid}&mid={quote(raw_mid)}&mode={mode_arg}"
+                            stream_resp = session.get(stream_url, timeout=15.0)
+                            if stream_resp.status_code == 200 and stream_resp.content and len(stream_resp.content) > 10:
+                                content_bytes = stream_resp.content
+                                text_sample = content_bytes[:1024].decode("utf-8", errors="ignore")
+                                if _is_polluted_coremail_shell(text_sample):
+                                    continue
+
+                                if mode_arg == "eml":
+                                    if not text_sample.strip().lower().startswith("<!doctype") and any(
+                                        h in text_sample for h in ("From:", "from:", "Subject:", "subject:", "MIME-Version:", "mime-version:")
+                                    ):
+                                        parsed = self._parse_raw_email(str(uid), content_bytes)
+                                        if parsed and (parsed.get("body_text") or parsed.get("body_html")):
+                                            body_text = parsed.get("body_text", "")
+                                            body_html = parsed.get("body_html", "")
+                                            if parsed.get("attachments") and not attachments:
+                                                attachments = parsed.get("attachments", [])
+                                            parsed_eml_info = {
+                                                "subject": parsed.get("subject", ""),
+                                                "sender_name": parsed.get("sender_name", ""),
+                                                "sender_email": parsed.get("sender_email", ""),
+                                                "to_list": parsed.get("to_list", []),
+                                                "cc_list": parsed.get("cc_list", []),
+                                                "date_str": parsed.get("date_str", "")
+                                            }
+                                            break
+                                elif mode_arg == "html":
+                                    full_html_text = stream_resp.text if isinstance(stream_resp.text, str) else content_bytes.decode("utf-8", errors="ignore")
+                                    if not _is_polluted_coremail_shell(full_html_text):
+                                        is_pure_eml = any(h in text_sample[:256] for h in ("From:", "Subject:")) and not any(tag in full_html_text.lower() for tag in ("<html", "<body", "<div", "<p", "<table", "<br"))
+                                        if not is_pure_eml:
+                                            body_text, body_html = _clean_and_extract_html_and_text(full_html_text)
+                                            if body_html or body_text:
+                                                break
+                                elif mode_arg == "text":
+                                    full_plain_text = stream_resp.text if isinstance(stream_resp.text, str) else content_bytes.decode("utf-8", errors="ignore")
+                                    if not _is_polluted_coremail_shell(full_plain_text):
+                                        is_pure_eml = any(h in text_sample[:256] for h in ("From:", "Subject:")) and any(h in text_sample[:512] for h in ("MIME-Version:", "Content-Type:"))
+                                        if not is_pure_eml:
+                                            body_text = full_plain_text
+                                            break
+                        except Exception:
+                            continue
+
+                # =============================================================
+                # 第 3 步：HTML 正文净化与纯文本提取（移除 script/style 等外壳）
+                # =============================================================
+                if body_html:
+                    c_text, c_html = _clean_and_extract_html_and_text(body_html)
+                    if c_html:
+                        body_html = c_html
+                    if not body_text and c_text:
+                        body_text = c_text
+
+                if body_text or body_html or attachments:
+                    from_dict = m_var.get("from") if isinstance(m_var.get("from"), dict) else {}
+                    return {
+                        "subject": parsed_eml_info.get("subject") or m_var.get("subject", ""),
+                        "sender_name": parsed_eml_info.get("sender_name") or from_dict.get("name", ""),
+                        "sender_email": parsed_eml_info.get("sender_email") or from_dict.get("email", ""),
+                        "to_list": parsed_eml_info.get("to_list") or [],
+                        "cc_list": parsed_eml_info.get("cc_list") or [],
+                        "date_str": parsed_eml_info.get("date_str") or "",
+                        "body_text": body_text,
+                        "body_html": body_html,
+                        "attachments": attachments,
+                        "is_body_loaded": 1
+                    }
             except Exception as e:
                 if isinstance(e, ValueError) and "认证失败" in str(e):
                     raise e
@@ -1111,6 +1281,7 @@ class CoremailClient:
                             subject = decode_mime_str(msg.get("Subject", "(无主题)"))
                             message_id = decode_mime_str(msg.get("Message-ID", ""))
                             date_str = decode_mime_str(msg.get("Date", ""))
+                            rec_ts, std_date_str = parse_email_date_to_timestamp(date_str)
 
                             from_list = parse_address_list(msg.get_all("From", []))
                             sender_name = from_list[0]["name"] if from_list else ""
@@ -1129,7 +1300,8 @@ class CoremailClient:
                                 "sender_email": sender_email,
                                 "to_list": to_list,
                                 "cc_list": cc_list,
-                                "date_str": date_str,
+                                "date_str": std_date_str,
+                                "received_timestamp": rec_ts,
                                 "folder_name": decoded_folder,
                                 "body_text": "",
                                 "body_html": "",

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import (
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QTextEdit,
     QSplitter, QMessageBox, QSystemTrayIcon, QMenu, QStatusBar,
     QProgressBar, QGroupBox, QButtonGroup, QAbstractItemView, QFrame,
-    QStyle, QApplication
+    QStyle, QApplication, QComboBox
 )
 
 from core.database import DatabaseManager
@@ -32,6 +32,13 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        # 主线程预热 jieba 大词典，避免 PyInstaller 环境下子线程栈溢出闪退
+        try:
+            import jieba
+            jieba.initialize()
+        except Exception:
+            pass
+
         self.db = DatabaseManager()
         self.learner = LocalEmailLearner()
 
@@ -50,6 +57,7 @@ class MainWindow(QMainWindow):
         self._init_ui()
         self._setup_tray()
         self._setup_timers()
+        self._update_folder_filter_options()
         self._refresh_current_view()
 
     def wake_up(self):
@@ -214,6 +222,20 @@ class MainWindow(QMainWindow):
         self.view_header_layout.addWidget(self.view_count_lbl)
         mid_layout.addLayout(self.view_header_layout)
 
+        # 文件夹分类切换与 AI 智能重扫工具栏
+        self.filter_box = QHBoxLayout()
+        self.filter_box.setSpacing(6)
+        self.folder_filter = QComboBox()
+        self.folder_filter.addItem("📂 全部文件夹", userData=None)
+        self.folder_filter.currentIndexChanged.connect(self._on_folder_filter_changed)
+        self.filter_box.addWidget(self.folder_filter, 1)
+
+        self.btn_rescan_ml = QPushButton("🤖 AI 重扫本地")
+        self.btn_rescan_ml.setToolTip("使用最新机器学习模型与习惯记忆，重新扫描并评估本地所有邮件")
+        self.btn_rescan_ml.clicked.connect(self._rescan_local_emails_with_ml)
+        self.filter_box.addWidget(self.btn_rescan_ml)
+        mid_layout.addLayout(self.filter_box)
+
         search_box = QHBoxLayout()
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("🔍 搜索主题、发件人或内容...")
@@ -223,6 +245,8 @@ class MainWindow(QMainWindow):
 
         self.item_list = QListWidget()
         self.item_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.item_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.item_list.customContextMenuRequested.connect(self._on_item_context_menu)
         self.item_list.currentItemChanged.connect(self._on_item_selected)
         self.item_list.itemDoubleClicked.connect(lambda item: self._on_item_selected(item, None))
         mid_layout.addWidget(self.item_list)
@@ -268,10 +292,17 @@ class MainWindow(QMainWindow):
         self.btn_create_memo_from_mail.clicked.connect(self._create_memo_from_email)
         act_layout.addWidget(self.btn_create_memo_from_mail)
 
-        self.btn_ignore = QPushButton("🚫 无需流转 (训练忽略)")
+        self.btn_mark_pending = QPushButton("📌 标记为待流转")
+        self.btn_mark_pending.setObjectName("btn_success")
+        self.btn_mark_pending.setToolTip("将此邮件加入待流转协同列表，自动预载正文附件并训练 AI 增量特征")
+        self.btn_mark_pending.clicked.connect(self._mark_current_email_as_pending)
+        act_layout.addWidget(self.btn_mark_pending)
+
+        self.btn_ignore = QPushButton("🚫 无需流转")
         self.btn_ignore.setObjectName("btn_danger")
         self.btn_ignore.setProperty("danger", True)
-        self.btn_ignore.clicked.connect(self._ignore_email)
+        self.btn_ignore.setToolTip("将此邮件移出待流转列表，并训练 AI 忽略此类邮件")
+        self.btn_ignore.clicked.connect(self._mark_current_email_as_ignored)
         act_layout.addWidget(self.btn_ignore)
 
         self.right_layout.addWidget(self.mail_actions_group)
@@ -402,7 +433,32 @@ class MainWindow(QMainWindow):
             self.current_view = "all_emails"
         elif btn_id == 3:
             self.current_view = "memos"
+        self._update_folder_filter_options()
         self._refresh_current_view()
+
+    def _on_folder_filter_changed(self, index: int):
+        self._refresh_current_view()
+
+    def _update_folder_filter_options(self):
+        """动态加载当前账号下所有文件夹及对应邮件数"""
+        current_val = self.folder_filter.currentData()
+        self.folder_filter.blockSignals(True)
+        self.folder_filter.clear()
+
+        folder_counts = self.db.get_folder_counts()
+        total_count = sum(f.get("count", 0) for f in folder_counts)
+        self.folder_filter.addItem(f"📂 全部文件夹 ({total_count})", userData=None)
+
+        restore_idx = 0
+        for idx, f in enumerate(folder_counts, start=1):
+            f_name = f.get("folder_name", "")
+            cnt = f.get("count", 0)
+            self.folder_filter.addItem(f"📁 {f_name} ({cnt})", userData=f_name)
+            if current_val is not None and f_name == current_val:
+                restore_idx = idx
+
+        self.folder_filter.setCurrentIndex(restore_idx)
+        self.folder_filter.blockSignals(False)
 
     def _ensure_email_body_loaded(self, em: Dict[str, Any]) -> bool:
         """按需加载单封邮件的正文与附件（针对普通未命中流转邮件的延迟加载）"""
@@ -444,26 +500,32 @@ class MainWindow(QMainWindow):
         if self.current_view in ("pending", "all_emails"):
             self.mail_actions_group.setVisible(True)
             self.memo_actions_group.setVisible(False)
+            self.folder_filter.setVisible(True)
+            self.btn_rescan_ml.setVisible(True)
+
             is_matched_only = (self.current_view == "pending")
             status_filter = "pending" if self.current_view == "pending" else None
+            folder_name = self.folder_filter.currentData()
 
             emails = self.db.get_all_emails(
-                limit=150,
+                limit=200,
                 status_filter=status_filter,
                 is_matched_only=is_matched_only,
-                keyword=kw
+                keyword=kw,
+                folder_filter=folder_name
             )
 
             # 更新未读徽标计数与中栏视图标题
             pending_count = len(self.db.get_pending_emails())
             self.btn_view_pending.setText(f"📥 待流转协同 ({pending_count})")
 
+            folder_label = f" [{folder_name}]" if folder_name else ""
             if self.current_view == "pending":
                 self.view_title_lbl.setText("📥 待流转协同")
-                self.view_count_lbl.setText(f"共 {len(emails)} 封待协同邮件")
+                self.view_count_lbl.setText(f"共 {len(emails)} 封待协同邮件{folder_label}")
             else:
                 self.view_title_lbl.setText("📑 全部历史邮件")
-                self.view_count_lbl.setText(f"共 {len(emails)} 封邮件")
+                self.view_count_lbl.setText(f"共 {len(emails)} 封邮件{folder_label}")
 
             for em in emails:
                 item = QListWidgetItem()
@@ -487,6 +549,8 @@ class MainWindow(QMainWindow):
         elif self.current_view == "memos":
             self.mail_actions_group.setVisible(False)
             self.memo_actions_group.setVisible(True)
+            self.folder_filter.setVisible(False)
+            self.btn_rescan_ml.setVisible(False)
             self.view_title_lbl.setText("📝 自定义备忘录")
 
             memos = self.db.get_memos(keyword=kw)
@@ -582,10 +646,14 @@ class MainWindow(QMainWindow):
 
         self.detail_header_lbl.setText(header_html)
 
-        if em.get("body_html"):
-            self.detail_body_view.setHtml(em.get("body_html"))
+        body_html = em.get("body_html", "")
+        body_text = em.get("body_text", "")
+        if body_html:
+            self.detail_body_view.setHtml(body_html)
+        elif body_text and any(tag in body_text.lower() for tag in ("<html", "<body", "<div", "<p", "<table", "<br", "<span", "<h1", "<h2", "<h3")):
+            self.detail_body_view.setHtml(body_text)
         else:
-            self.detail_body_view.setPlainText(em.get("body_text", ""))
+            self.detail_body_view.setPlainText(body_text or "")
 
         # 动态更新“改写为新邮件”按钮文字为推荐收件人姓名或邮箱
         suggested = em.get("suggested_to", [])
@@ -602,6 +670,16 @@ class MainWindow(QMainWindow):
             self.btn_rewrite_new.setText(f"✨ 改写为新邮件（推荐发给：{target_disp}）")
         else:
             self.btn_rewrite_new.setText("✨ 改写为新邮件发送")
+
+        # 按钮显隐切换：【待流转】(is_matched=1且未忽略) 显示“🚫 无需流转”，隐藏“📌 标记为待流转”；
+        # 【全部邮件】/普通邮件(is_matched=0或status='ignored') 显示“📌 标记为待流转”，隐藏“🚫 无需流转”
+        is_matched = (em.get("is_matched", 0) == 1 and em.get("status") != "ignored")
+        if is_matched:
+            self.btn_mark_pending.setVisible(False)
+            self.btn_ignore.setVisible(True)
+        else:
+            self.btn_mark_pending.setVisible(True)
+            self.btn_ignore.setVisible(False)
 
     def _display_memo_detail(self, m: Dict[str, Any]):
         chk_lines = []
@@ -623,6 +701,8 @@ class MainWindow(QMainWindow):
         self.detail_header_lbl.setText("请在左侧列表中选择一项以查看详细内容")
         self.detail_body_view.clear()
         self.btn_rewrite_new.setText("✨ 改写为新邮件发送")
+        self.btn_mark_pending.setVisible(False)
+        self.btn_ignore.setVisible(False)
 
     # =========================================================================
     # 同步与流转业务动作
@@ -654,6 +734,7 @@ class MainWindow(QMainWindow):
         self.sync_progress.setVisible(False)
         self.btn_sync_now.setEnabled(True)
         self.status_bar.showMessage(f"邮件检查完成，拉取到 {count} 封新邮件", 4000)
+        self._update_folder_filter_options()
         self._refresh_current_view()
 
         if count > 0:
@@ -693,29 +774,162 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self._refresh_current_view()
 
-    def _ignore_email(self):
+    def _on_item_context_menu(self, pos):
+        """邮件列表右键快捷菜单：按状态切换待流转与无需流转"""
+        item = self.item_list.itemAt(pos)
+        if not item:
+            return
+        data = item.data(Qt.UserRole)
+        if not data or self.current_view not in ("pending", "all_emails"):
+            return
+
+        menu = QMenu(self)
+        is_matched = (data.get("is_matched") == 1 and data.get("status") != "ignored")
+        if is_matched:
+            act_ignore = menu.addAction("🚫 标记为无需流转 (移出待办并训练AI)")
+            act_ignore.triggered.connect(lambda: self._mark_email_as_ignored_by_data(data))
+        else:
+            act_pending = menu.addAction("📌 标记为待流转 (加入协同并训练AI)")
+            act_pending.triggered.connect(lambda: self._mark_email_as_pending_by_data(data))
+
+        menu.exec(self.item_list.mapToGlobal(pos))
+
+    def _mark_current_email_as_pending(self):
         if not self.selected_email:
             return
-        subj = self.selected_email.get("subject")
-        if QMessageBox.question(self, "无需流转", f"确定将邮件【{subj}】标记为无需流转吗？\n（系统将记录此操作训练机器学习模型）") == QMessageBox.Yes:
-            self.db.update_email_status(self.selected_email["uid"], "ignored")
-            # 训练负样本
-            self.learner.learn_from_user_action(
-                email_data=self.selected_email,
-                action_label=0
-            )
-            self.db.save_training_sample(
-                email_uid=self.selected_email["uid"],
-                sender_email=self.selected_email.get("sender_email", ""),
-                subject=subj,
-                full_body_text=self.selected_email.get("body_text", ""),
-                final_sent_text="",
-                action_label=0,
-                chosen_mode="",
-                chosen_to_emails=[],
-                chosen_cc_emails=[]
-            )
-            self._refresh_current_view()
+        self._mark_email_as_pending_by_data(self.selected_email)
+
+    def _mark_email_as_pending_by_data(self, em: Dict[str, Any]):
+        """标记邮件为待流转：更新数据库，训练正样本，异步预拉取正文与附件"""
+        if not em:
+            return
+        uid = em.get("uid", "")
+        subj = em.get("subject", "")
+
+        # 1. 数据库更新为待流转
+        self.db.mark_email_need_action(uid)
+        em["is_matched"] = 1
+        em["status"] = "pending"
+
+        # 2. 机器学习正样本增量训练
+        settings = self.db.get_all_settings()
+        my_email = settings.get("user", "")
+        self.learner.learn_from_user_action(
+            email_data=em,
+            action_label=1,
+            chosen_mode=em.get("recommended_mode", "rewrite_new"),
+            chosen_f_emails=em.get("suggested_to", []),
+            my_email=my_email
+        )
+        self.db.save_training_sample(
+            email_uid=uid,
+            sender_email=em.get("sender_email", ""),
+            subject=subj,
+            full_body_text=em.get("body_text", ""),
+            final_sent_text="",
+            action_label=1,
+            chosen_mode=em.get("recommended_mode", "rewrite_new"),
+            chosen_to_emails=em.get("suggested_to", []),
+            chosen_cc_emails=[]
+        )
+
+        # 3. 若尚未预载完整正文与附件，立即启动异步拉取
+        if em.get("is_body_loaded", 1) == 0:
+            self._load_email_body_async(em)
+
+        # 4. 刷新列表与状态栏提示
+        self.status_bar.showMessage("✅ 已将该邮件标记为【待流转】，机器学习已记录此类邮件特征", 4000)
+        self._update_folder_filter_options()
+        self._refresh_current_view()
+
+    def _mark_current_email_as_ignored(self):
+        if not self.selected_email:
+            return
+        self._mark_email_as_ignored_by_data(self.selected_email)
+
+    def _mark_email_as_ignored_by_data(self, em: Dict[str, Any]):
+        """标记邮件为无需流转：更新数据库，训练负样本，移出待流转列表"""
+        if not em:
+            return
+        uid = em.get("uid", "")
+        subj = em.get("subject", "")
+        if QMessageBox.question(
+            self,
+            "无需流转确认",
+            f"确定将邮件【{subj}】标记为无需流转吗？\n（系统将从待流转移出，并训练机器学习模型记住忽略此类邮件）"
+        ) != QMessageBox.Yes:
+            return
+
+        # 1. 数据库更新为无需流转
+        self.db.mark_email_no_action(uid)
+        em["is_matched"] = 0
+        em["status"] = "ignored"
+
+        # 2. 机器学习负样本增量训练
+        settings = self.db.get_all_settings()
+        my_email = settings.get("user", "")
+        self.learner.learn_from_user_action(
+            email_data=em,
+            action_label=0,
+            my_email=my_email
+        )
+        self.db.save_training_sample(
+            email_uid=uid,
+            sender_email=em.get("sender_email", ""),
+            subject=subj,
+            full_body_text=em.get("body_text", ""),
+            final_sent_text="",
+            action_label=0,
+            chosen_mode="",
+            chosen_to_emails=[],
+            chosen_cc_emails=[]
+        )
+
+        # 3. 刷新列表与状态栏提示
+        self.status_bar.showMessage("🚫 已移出待流转列表，机器学习已记住忽略此类邮件", 4000)
+        self._update_folder_filter_options()
+        self._refresh_current_view()
+
+    def _rescan_local_emails_with_ml(self):
+        """使用最新机器学习模型与习惯记忆，重新扫描并评估本地所有邮件"""
+        settings = self.db.get_all_settings()
+        my_email = settings.get("user", "")
+        contacts = self.db.get_all_contacts()
+
+        self.status_bar.showMessage("⏳ 正在使用最新 AI 机器学习模型扫描评估本地邮件...")
+        all_emails = self.db.get_all_emails(limit=2000)
+        newly_matched_count = 0
+
+        for em in all_emails:
+            st = em.get("status")
+            if st in ("sent_new", "forwarded"):
+                continue
+
+            pred = self.learner.predict_email(em, candidate_contacts=contacts, my_email=my_email)
+            need_prob = pred.get("need_action_prob", 0.0)
+            is_rec = pred.get("is_ml_recommended", False) or need_prob >= 0.55
+
+            if is_rec:
+                if em.get("is_matched") != 1 or em.get("status") == "ignored":
+                    self.db.update_email_prediction(
+                        uid=em["uid"],
+                        is_matched=1,
+                        ml_confidence=need_prob,
+                        recommended_mode=pred.get("recommended_mode", "rewrite_new"),
+                        suggested_to=pred.get("predicted_f_emails", []),
+                        matched_rule_name="🤖 全文机器学习智能推荐"
+                    )
+                    self.db.update_email_status(em["uid"], "pending")
+                    newly_matched_count += 1
+
+        self._update_folder_filter_options()
+        self._refresh_current_view()
+        self.status_bar.showMessage(f"✅ AI 智能重扫完成，新识别出 {newly_matched_count} 封待流转邮件", 5000)
+        QMessageBox.information(
+            self,
+            "AI 智能重扫完成",
+            f"本地邮件已全部使用最新机器学习模型与习惯记忆重新评估！\n\n新增识别并标记了 {newly_matched_count} 封待流转邮件。"
+        )
 
     def _create_memo_from_email(self):
         if not self.selected_email:
@@ -776,3 +990,5 @@ class MainWindow(QMainWindow):
             settings = self.db.get_all_settings()
             interval_secs = int(settings.get("poll_interval", 60) or 60)
             self.mail_timer.setInterval(max(15, interval_secs) * 1000)
+            # 延迟 300 毫秒待设置窗口完全销毁后再启动后台同步
+            QTimer.singleShot(300, lambda: self._start_email_sync(is_manual=True))

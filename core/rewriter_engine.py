@@ -237,7 +237,8 @@ class RewriterEngine:
         target_contacts: List[Dict[str, Any]],
         selected_f_emails: List[str],
         custom_rewrite_rules: Optional[List[Dict[str, Any]]] = None,
-        closing_sign: str = "请协助跟进处理，谢谢！"
+        closing_sign: str = "请协助跟进处理，谢谢！",
+        custom_forward_template: Optional[str] = None
     ) -> Dict[str, str]:
         """构建待发邮件的完整内容（双模式：新建改写 vs 标准转发）"""
         orig_subject = (email_data.get("subject") or "").strip()
@@ -276,7 +277,13 @@ class RewriterEngine:
             }
         else:
             fw_subject = orig_subject if orig_subject.lower().startswith(("fw:", "转发:")) else f"Fw: {orig_subject}"
-            top_lines = [salutation, f"{sender_name}发来以下协调事项，{closing_sign}"] if salutation else [f"{sender_name}发来以下协调事项，{closing_sign}"]
+            if custom_forward_template and custom_forward_template.strip():
+                formatted_comment = custom_forward_template.strip()
+                formatted_comment = formatted_comment.replace("{sender_name}", sender_name)
+                formatted_comment = formatted_comment.replace("{closing_sign}", closing_sign)
+                top_lines = [salutation, formatted_comment] if salutation else [formatted_comment]
+            else:
+                top_lines = [salutation, f"{sender_name}发来以下协调事项，{closing_sign}"] if salutation else [f"{sender_name}发来以下协调事项，{closing_sign}"]
             top_comment = "\n".join(top_lines)
 
             sender_str = f"{email_data.get('sender_name', '')} <{email_data.get('sender_email', '')}>".strip()
