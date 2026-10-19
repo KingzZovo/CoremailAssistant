@@ -40,15 +40,15 @@ class MailSyncWorker(QThread):
             existing_uids = self.db.get_existing_uids()
             max_fetch = int(settings.get("max_fetch_count", 30) or 30)
 
-            self.progress_msg.emit("正在扫描收件箱最新邮件...")
-            new_emails = client.fetch_new_emails(existing_uids, max_fetch=max_fetch)
+            self.progress_msg.emit("正在扫描收件箱及所有自定义文件夹最新邮件信头...")
+            new_headers, folder_count = client.fetch_new_email_headers(existing_uids, max_fetch_per_folder=max_fetch)
 
-            if not new_emails:
-                self.progress_msg.emit("检查完毕，没有发现新邮件")
+            if not new_headers:
+                self.progress_msg.emit(f"检查完毕（共扫描 {folder_count} 个文件夹），没有发现新邮件")
                 self.sync_finished.emit(0, [])
                 return
 
-            self.progress_msg.emit(f"拉取到 {len(new_emails)} 封新邮件，正在执行智能流转分析...")
+            self.progress_msg.emit(f"从 {folder_count} 个文件夹扫描到 {len(new_headers)} 封新邮件，正在执行分流初筛与按需预载...")
 
             contacts = self.db.get_all_contacts()
             match_rules = self.db.get_all_match_rules(enabled_only=True)
@@ -63,8 +63,9 @@ class MailSyncWorker(QThread):
                 )
 
             processed_emails = []
+            matched_count = 0
 
-            for em in new_emails:
+            for em in new_headers:
                 is_matched = 0
                 ml_confidence = 0.0
                 matched_rule_name = ""
@@ -75,7 +76,8 @@ class MailSyncWorker(QThread):
 
                 subj = em.get("subject", "")
                 body = em.get("body_text", "")
-                full_search_text = f"{subj} {body}"
+                folder = em.get("folder_name", "")
+                full_search_text = f"{subj} {body} {folder}"
 
                 # 1. 规则引擎优先匹配 (若包含 rules_and_ml 或 rules_only)
                 if filter_mode in ("rules_and_ml", "rules_only"):
@@ -108,16 +110,35 @@ class MailSyncWorker(QThread):
                         recommended_mode = pred.get("recommended_mode", "rewrite_new")
                         suggested_to = pred.get("predicted_f_emails", [])
 
-                # 3. 本地 Ollama 混合分析与摘要
-                if ollama_client and ollama_client.is_available() and is_matched:
+                # 阶段 2: 仅当判定为协调邮件时，立即自动拉取该邮件的完整正文和下载原附件
+                if is_matched:
+                    matched_count += 1
+                    self.progress_msg.emit(f"检测到需流转邮件「{subj[:18]}」，正在预载正文与附件...")
                     try:
-                        ai_res = ollama_client.analyze_and_rewrite_email(em, contacts)
-                        ai_summary = ai_res.get("summary", "")
-                        ai_urgency = ai_res.get("urgency", "普通")
-                        if not suggested_to and ai_res.get("suggested_contacts"):
-                            suggested_to = ai_res.get("suggested_contacts")
+                        detail = client.fetch_single_email_detail(
+                            em["uid"],
+                            folder_name=em.get("raw_folder") or em.get("folder_name", "INBOX")
+                        )
+                        em["body_text"] = detail.get("body_text") or em.get("body_text", "")
+                        em["body_html"] = detail.get("body_html", "")
+                        em["attachments"] = detail.get("attachments", [])
+                        em["is_body_loaded"] = detail.get("is_body_loaded", 1)
                     except Exception:
-                        pass
+                        em["is_body_loaded"] = 0
+
+                    # 3. 本地 Ollama 深度润色与分析
+                    if ollama_client and ollama_client.is_available():
+                        try:
+                            ai_res = ollama_client.analyze_and_rewrite_email(em, contacts)
+                            ai_summary = ai_res.get("summary", "")
+                            ai_urgency = ai_res.get("urgency", "普通")
+                            if not suggested_to and ai_res.get("suggested_contacts"):
+                                suggested_to = ai_res.get("suggested_contacts")
+                        except Exception:
+                            pass
+                else:
+                    # 普通邮件不下载正文与附件，节省空间并提速
+                    em["is_body_loaded"] = 0
 
                 em["is_matched"] = is_matched
                 em["ml_confidence"] = ml_confidence
@@ -131,7 +152,8 @@ class MailSyncWorker(QThread):
                 self.db.insert_email(em)
                 processed_emails.append(em)
 
-            self.progress_msg.emit(f"同步完成！新增 {len(processed_emails)} 封邮件")
+            msg = f"同步完成：共扫描 {folder_count} 个文件夹，新增 {len(processed_emails)} 封邮件（其中 {matched_count} 封需协调邮件已预载正文与附件）"
+            self.progress_msg.emit(msg)
             self.sync_finished.emit(len(processed_emails), processed_emails)
 
         except Exception as e:

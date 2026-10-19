@@ -70,10 +70,20 @@ class DatabaseManager:
                 ai_urgency TEXT DEFAULT '普通',
                 suggested_to_json TEXT DEFAULT '[]',
                 status TEXT DEFAULT 'pending',
+                folder_name TEXT DEFAULT '收件箱',
+                is_body_loaded INTEGER DEFAULT 1,
                 processed_at TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """)
+
+            # 字段自动平滑升级（若旧库不存在这两个字段则动态添加）
+            cursor.execute("PRAGMA table_info(emails);")
+            existing_cols = {row["name"] for row in cursor.fetchall()}
+            if "folder_name" not in existing_cols:
+                cursor.execute("ALTER TABLE emails ADD COLUMN folder_name TEXT DEFAULT '收件箱';")
+            if "is_body_loaded" not in existing_cols:
+                cursor.execute("ALTER TABLE emails ADD COLUMN is_body_loaded INTEGER DEFAULT 1;")
 
             # 2. 全功能自定义备忘录表
             cursor.execute("""
@@ -300,8 +310,9 @@ class DatabaseManager:
                     uid, message_id, subject, sender_name, sender_email,
                     to_list_json, cc_list_json, date_str, body_text, body_html,
                     attachments_json, is_matched, ml_confidence, matched_rule_name,
-                    recommended_mode, ai_summary, ai_urgency, suggested_to_json, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                    recommended_mode, ai_summary, ai_urgency, suggested_to_json, status,
+                    folder_name, is_body_loaded
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                 """,
                 (
                     str(email_data.get("uid", "")),
@@ -323,6 +334,8 @@ class DatabaseManager:
                     email_data.get("ai_urgency", "普通"),
                     sugg_to_json,
                     email_data.get("status", "pending"),
+                    email_data.get("folder_name", "收件箱"),
+                    int(email_data.get("is_body_loaded", 1)),
                 ),
             )
             conn.commit()
@@ -400,6 +413,34 @@ class DatabaseManager:
             cursor.execute(
                 "UPDATE emails SET status = ?, processed_at = ? WHERE uid = ?;",
                 (status, processed_at, str(uid)),
+            )
+            conn.commit()
+
+    def update_email_body_and_attachments(
+        self,
+        uid: str,
+        body_text: str,
+        body_html: str,
+        attachments: Any
+    ) -> None:
+        """按需下载正文与附件后，更新数据库中该邮件的内容并标记 is_body_loaded = 1"""
+        attach_json = (
+            json.dumps(attachments, ensure_ascii=False)
+            if not isinstance(attachments, str)
+            else attachments
+        )
+        with self._op_lock, self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE emails SET
+                    body_text = ?,
+                    body_html = ?,
+                    attachments_json = ?,
+                    is_body_loaded = 1
+                WHERE uid = ?;
+                """,
+                (body_text, body_html, attach_json, str(uid)),
             )
             conn.commit()
 

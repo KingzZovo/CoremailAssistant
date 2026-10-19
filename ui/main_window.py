@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from core.database import DatabaseManager
+from core.mail_client import CoremailClient
 from core.ml_learner import LocalEmailLearner
 from core.worker_threads import MailSyncWorker
 from .compose_send_dialog import ComposeAndSendDialog
@@ -325,6 +326,39 @@ class MainWindow(QMainWindow):
             self.current_view = "memos"
         self._refresh_current_view()
 
+    def _ensure_email_body_loaded(self, em: Dict[str, Any]) -> bool:
+        """按需加载单封邮件的正文与附件（针对普通未命中流转邮件的延迟加载）"""
+        if not em or em.get("is_body_loaded", 1) != 0:
+            return True
+
+        self.status_bar.showMessage("⏳ 正在按需加载该邮件正文与附件...", 5000)
+        try:
+            client = CoremailClient(self.db.get_all_settings())
+            detail = client.fetch_single_email_detail(
+                uid=em.get("uid", ""),
+                folder_name=em.get("folder_name", "INBOX")
+            )
+            body_text = detail.get("body_text", "")
+            body_html = detail.get("body_html", "")
+            attachments = detail.get("attachments", [])
+
+            em["body_text"] = body_text
+            em["body_html"] = body_html
+            em["attachments"] = attachments
+            em["is_body_loaded"] = 1
+
+            self.db.update_email_body_and_attachments(
+                uid=em.get("uid", ""),
+                body_text=body_text,
+                body_html=body_html,
+                attachments=attachments
+            )
+            self.status_bar.showMessage("✅ 邮件正文与附件加载完成", 3000)
+            return True
+        except Exception as e:
+            self.status_bar.showMessage(f"❌ 按需加载正文失败: {e}", 5000)
+            return False
+
     def _refresh_current_view(self):
         kw = self.search_input.text().strip() or None
         self.item_list.clear()
@@ -367,7 +401,8 @@ class MainWindow(QMainWindow):
                     status_tag = f" [{em.get('matched_rule_name') or '推荐流转'}]"
 
                 sender_name = em.get("sender_name") or em.get("sender_email")
-                item.setText(f"{em.get('subject')}{status_tag}\n来自: {sender_name} | {em.get('date_str')}")
+                folder_tag = f"[📁 {em.get('folder_name', '收件箱')}] "
+                item.setText(f"{folder_tag}{em.get('subject')}{status_tag}\n来自: {sender_name} | {em.get('date_str')}")
                 item.setData(Qt.UserRole, em)
                 self.item_list.addItem(item)
 
@@ -404,6 +439,8 @@ class MainWindow(QMainWindow):
         if self.current_view in ("pending", "all_emails"):
             self.selected_email = data
             self.selected_memo = None
+            if data.get("is_body_loaded", 1) == 0:
+                self._ensure_email_body_loaded(data)
             self._display_email_detail(data)
         elif self.current_view == "memos":
             self.selected_memo = data
@@ -414,9 +451,11 @@ class MainWindow(QMainWindow):
         to_names = ", ".join([f"{x.get('name')}<{x.get('email')}>" for x in em.get("to_list", [])])
         cc_names = ", ".join([f"{x.get('name')}<{x.get('email')}>" for x in em.get("cc_list", [])])
         rec_f = ", ".join(em.get("suggested_to", [])) or "暂无推荐收件人"
+        folder_disp = em.get("folder_name") or "收件箱"
 
         header_html = f"""
         <div style="font-size:15px; font-weight:700; color:#1E3A8A; margin-bottom:6px;">{em.get('subject')}</div>
+        <b>所属文件夹：</b>📁 {folder_disp}<br>
         <b>发件人：</b>{em.get('sender_name')} &lt;{em.get('sender_email')}&gt;<br>
         <b>发送时间：</b>{em.get('date_str')}<br>
         <b>原收件人：</b>{to_names}<br>
@@ -538,6 +577,8 @@ class MainWindow(QMainWindow):
         if not self.selected_email:
             QMessageBox.information(self, "操作提示", "请先在列表中选中一封邮件")
             return
+        if self.selected_email.get("is_body_loaded", 1) == 0:
+            self._ensure_email_body_loaded(self.selected_email)
         data = dict(self.selected_email)
         data["recommended_mode"] = mode
         dlg = ComposeAndSendDialog(data, self)
@@ -571,6 +612,8 @@ class MainWindow(QMainWindow):
     def _create_memo_from_email(self):
         if not self.selected_email:
             return
+        if self.selected_email.get("is_body_loaded", 1) == 0:
+            self._ensure_email_body_loaded(self.selected_email)
         subj = self.selected_email.get("subject", "")
         body_html = self.selected_email.get("body_html") or f"<p>{self.selected_email.get('body_text', '')}</p>"
         dlg = MemoEditDialog(

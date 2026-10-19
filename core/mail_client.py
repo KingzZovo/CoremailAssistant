@@ -126,6 +126,40 @@ def normalize_host_and_port(raw_host: str, default_port: int = 143) -> Tuple[str
     return clean_host, port
 
 
+def decode_imap_utf7(folder_name: str) -> str:
+    """解码 IMAP Modified UTF-7 编码的文件夹名称（如 &V4NXPpCuTvY- -> 项目组）"""
+    if not folder_name or "&" not in folder_name:
+        return folder_name
+
+    def _sub_repl(match):
+        raw_b64 = match.group(1).replace(",", "/")
+        pad = len(raw_b64) % 4
+        if pad:
+            raw_b64 += "=" * (4 - pad)
+        try:
+            return base64.b64decode(raw_b64.encode("ascii")).decode("utf-16-be")
+        except Exception:
+            return match.group(0)
+
+    res = folder_name.replace("&-", "\x00")
+    res = re.sub(r"&([A-Za-z0-9+,]+)-", _sub_repl, res)
+    res = res.replace("\x00", "&")
+    return res
+
+
+def is_system_non_inbox_folder(folder_id: Any, folder_name: str) -> bool:
+    """判断是否为草稿箱、已发送、已删除、垃圾箱等非收信类文件夹"""
+    fid_str = str(folder_id).strip()
+    if fid_str in ("2", "3", "4", "5"):
+        return True
+    lower = (folder_name or "").lower().strip()
+    exclude_keywords = [
+        "草稿", "已发送", "已删除", "垃圾", "病毒",
+        "draft", "sent", "trash", "junk", "spam", "deleted"
+    ]
+    return any(k in lower for k in exclude_keywords)
+
+
 def probe_coremail_server_ports(raw_host: str) -> Dict[str, Any]:
     """
     真实探测 Coremail 服务器开放的收发端口（彻底杜绝假阳性，并探测 HTTP/HTTPS 与 POP3 端口）。
@@ -412,137 +446,294 @@ class CoremailClient:
 
         raise ConnectionError(f"Coremail WebAPI 登录失败：所有候选服务地址均不可用。最后错误: {last_error}")
 
-    def _http_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+    def _http_get_all_folders(self, base_url: str, sid: str) -> List[Dict[str, Any]]:
+        """调用 /coremail/s/json?func=mbox:getAllFolders 获取所有收件类文件夹（收件箱 + 用户自定义文件夹）"""
+        session = self._get_http_session()
+        folders = []
+        try:
+            url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:getAllFolders"
+            resp = session.post(url, json={}, timeout=10.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data.get("code") == "S_OK":
+                    raw_folders = data.get("var") or []
+                    if isinstance(raw_folders, dict):
+                        raw_folders = raw_folders.get("folders") or raw_folders.get("list") or raw_folders.get("items") or []
+                    for f in raw_folders:
+                        fid = f.get("id") or f.get("fid")
+                        fname = f.get("name") or f.get("displayName") or (f"自定义文件夹_{fid}" if fid != 1 else "收件箱")
+                        if fid is not None and not is_system_non_inbox_folder(fid, fname):
+                            folders.append({"id": fid, "name": fname})
+        except Exception:
+            pass
+
+        # 始终保底收件箱 (fid=1)
+        if not any(f["id"] in (1, "1") for f in folders):
+            folders.insert(0, {"id": 1, "name": "收件箱"})
+        return folders
+
+    def _http_fetch_new_email_headers(
+        self, existing_uids: set, max_fetch_per_folder: int = 25
+    ) -> Tuple[List[Dict[str, Any]], int]:
         """
-        通过 Coremail WebAPI (/coremail/s/json?func=mbox:listMessages) 拉取收件箱邮件列表，
-        优先通过 /coremail/s/eml 拉取原始 EML 由 _parse_raw_email 完整解析，
-        次选通过 mbox:readMessage 解析正文及下载附件。
+        通过 Coremail WebAPI 扫描所有收信文件夹（收件箱 + 自定义文件夹）的邮件信头元数据。
+        极速轻量：仅拉取 mid/主题/发件人/时间/摘要，绝不在此阶段下载完整正文和附件。
+        返回 (headers_list, folder_count)
         """
-        new_emails = []
         base_url, sid = self._http_login()
         session = self._get_http_session()
 
-        list_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:listMessages"
-        list_payload = {
-            "fid": 1,
-            "start": 0,
-            "limit": max_fetch,
-            "order": "receivedDate",
-            "desc": True,
-            "returnTotal": True
-        }
+        folders = self._http_get_all_folders(base_url, sid)
+        headers = []
+        last_error = None
 
-        resp = session.post(list_url, json=list_payload, timeout=10.0)
-        if resp.status_code != 200:
-            raise RuntimeError(f"获取邮件列表失败，HTTP 状态码: {resp.status_code}")
+        for folder in folders:
+            fid = folder["id"]
+            fname = folder["name"]
+            list_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:listMessages"
+            list_payload = {
+                "fid": fid,
+                "start": 0,
+                "limit": max_fetch_per_folder,
+                "order": "receivedDate",
+                "desc": True,
+                "returnTotal": True
+            }
 
-        data = resp.json()
-        if data.get("code") != "S_OK":
-            raise RuntimeError(f"Coremail 获取邮件列表失败: {data.get('code')} - {data.get('message', '')}")
-
-        var = data.get("var", [])
-        if isinstance(var, dict):
-            items = var.get("messages") or var.get("items") or []
-        elif isinstance(var, list):
-            items = var
-        else:
-            items = []
-
-        for item in items:
-            mid = item.get("id") or item.get("mid")
-            if not mid:
-                continue
-            mid_str = str(mid)
-            if mid_str in existing_uids:
-                continue
-
-            parsed_email = None
-
-            # 方式 A：优先拉取标准 EML 原始数据，100% 还原富文本、内联图片与完整附件
             try:
-                eml_url = f"{base_url}/coremail/s/eml?sid={sid}&mid={quote(mid_str)}"
-                eml_resp = session.get(eml_url, timeout=15.0)
-                if eml_resp.status_code == 200 and eml_resp.content and len(eml_resp.content) > 10:
-                    parsed_email = self._parse_raw_email(mid_str, eml_resp.content)
-            except Exception:
-                parsed_email = None
+                resp = session.post(list_url, json=list_payload, timeout=10.0)
+                if resp.status_code != 200:
+                    last_error = f"获取文件夹[{fname}]失败: HTTP {resp.status_code}"
+                    continue
 
-            # 方式 B：EML 拉取失败时回退到 mbox:readMessage JSON 解析
-            if not parsed_email:
+                data = resp.json()
+                code = data.get("code")
+                if code in ("FA_INVALID_SESSION", "FA_EXPIRED"):
+                    # 会话失效，重新认证并重试该文件夹一次
+                    base_url, sid = self._http_login()
+                    list_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:listMessages"
+                    resp = session.post(list_url, json=list_payload, timeout=10.0)
+                    data = resp.json()
+                    code = data.get("code")
+
+                if code != "S_OK":
+                    last_error = f"获取文件夹[{fname}]失败: {code} - {data.get('message', '')}"
+                    continue
+
+                var = data.get("var", [])
+                # 兼容不同版本 Coremail 差异：可能是 list，也可能是 dict 内嵌 messages/list/items
+                if isinstance(var, dict):
+                    items = var.get("messages") or var.get("list") or var.get("items") or []
+                elif isinstance(var, list):
+                    items = var
+                else:
+                    items = []
+
+                for item in items:
+                    mid = item.get("id") or item.get("mid")
+                    if not mid:
+                        continue
+                    mid_str = str(mid)
+                    if mid_str in existing_uids:
+                        continue
+
+                    subject = decode_mime_str(item.get("subject", "(无主题)"))
+                    date_str = str(item.get("sentDate") or item.get("receivedDate") or "")
+
+                    raw_from = item.get("from") or ""
+                    from_list = parse_address_list([raw_from]) if raw_from else []
+                    sender_name = from_list[0]["name"] if from_list else (raw_from.split("<")[0].strip() if raw_from else "")
+                    sender_email = from_list[0]["email"] if from_list else (raw_from if "@" in raw_from else "")
+
+                    raw_to = item.get("to") or ""
+                    to_list = parse_address_list([raw_to]) if raw_to else []
+
+                    raw_cc = item.get("cc") or ""
+                    cc_list = parse_address_list([raw_cc]) if raw_cc else []
+
+                    summary = item.get("summary") or item.get("abstract") or item.get("desc") or ""
+
+                    headers.append({
+                        "uid": mid_str,
+                        "message_id": item.get("messageId", ""),
+                        "subject": subject,
+                        "sender_name": sender_name,
+                        "sender_email": sender_email,
+                        "to_list": to_list,
+                        "cc_list": cc_list,
+                        "date_str": date_str,
+                        "folder_name": fname,
+                        "folder_id": fid,
+                        "body_text": summary,
+                        "body_html": "",
+                        "attachments": [],
+                        "is_body_loaded": 0,
+                        "is_matched": 0,
+                    })
+            except Exception as e:
+                last_error = str(e)
+
+        if not headers and last_error and not existing_uids:
+            # 若所有文件夹均未能成功请求且记录了错误，抛出具体原因杜绝假无邮件
+            raise RuntimeError(f"Coremail 邮件拉取异常: {last_error}")
+
+        return headers, len(folders)
+
+    def fetch_single_email_detail(self, uid: str, folder_name: str = "INBOX") -> Dict[str, Any]:
+        """
+        按需单独拉取某一封邮件的完整正文 (HTML/Text) 并下载附件至本地磁盘 (Lazy-Load)
+        优先通过 /coremail/s/eml 原文下载，次选 mbox:readMessage JSON 模式，或回退 IMAP
+        """
+        # 1. WebAPI 模式
+        if self.protocol_mode == "coremail":
+            try:
+                base_url, sid = self._http_login()
+                session = self._get_http_session()
+
+                # 方式 A：优先 EML 方式拉取原始数据（100% 完整解析富文本与附件）
                 try:
-                    read_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:readMessage"
-                    read_resp = session.post(
-                        read_url,
-                        json={"mid": mid, "mode": "html", "markRead": False},
-                        timeout=15.0
-                    )
-                    if read_resp.status_code == 200:
-                        rdata = read_resp.json()
-                        if rdata.get("code") == "S_OK":
-                            m_var = rdata.get("var", {})
-                            subject = decode_mime_str(m_var.get("subject", "(无主题)"))
-                            message_id = m_var.get("messageId", "")
-                            date_str = str(m_var.get("sentDate") or m_var.get("receivedDate") or "")
-
-                            from_list = parse_address_list([m_var.get("from", "")])
-                            sender_name = from_list[0]["name"] if from_list else ""
-                            sender_email = from_list[0]["email"] if from_list else ""
-
-                            to_list = parse_address_list([m_var.get("to", "")])
-                            cc_list = parse_address_list([m_var.get("cc", "")])
-
-                            body_html = m_var.get("html") or m_var.get("content") or ""
-                            body_text = m_var.get("text") or ""
-                            if not body_text and body_html:
-                                body_text = re.sub(r"<[^>]+>", " ", body_html)
-                                body_text = re.sub(r"\s+", " ", body_text).strip()
-
-                            attachments = []
-                            raw_atts = m_var.get("attachments") or []
-                            if raw_atts:
-                                uid_attach_dir = os.path.join(self.attachment_root, mid_str)
-                                os.makedirs(uid_attach_dir, exist_ok=True)
-                                for att in raw_atts:
-                                    aid = att.get("id") or att.get("aid")
-                                    att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
-                                    safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
-                                    att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
-
-                                    if aid is not None:
-                                        att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(mid_str)}&aid={aid}"
-                                        try:
-                                            att_resp = session.get(att_url, timeout=20.0)
-                                            if att_resp.status_code == 200:
-                                                with open(att_path, "wb") as af:
-                                                    af.write(att_resp.content)
-                                                attachments.append({
-                                                    "filename": safe_fname,
-                                                    "filepath": att_path,
-                                                    "size": len(att_resp.content)
-                                                })
-                                        except Exception:
-                                            pass
-
-                            parsed_email = {
-                                "uid": mid_str,
-                                "message_id": message_id,
-                                "subject": subject,
-                                "sender_name": sender_name,
-                                "sender_email": sender_email,
-                                "to_list": to_list,
-                                "cc_list": cc_list,
-                                "date_str": date_str,
-                                "body_text": body_text,
-                                "body_html": body_html,
-                                "attachments": attachments,
+                    eml_url = f"{base_url}/coremail/s/eml?sid={sid}&mid={quote(str(uid))}"
+                    eml_resp = session.get(eml_url, timeout=20.0)
+                    if eml_resp.status_code == 200 and eml_resp.content and len(eml_resp.content) > 10:
+                        parsed = self._parse_raw_email(str(uid), eml_resp.content)
+                        if parsed:
+                            return {
+                                "subject": parsed.get("subject", ""),
+                                "sender_name": parsed.get("sender_name", ""),
+                                "sender_email": parsed.get("sender_email", ""),
+                                "to_list": parsed.get("to_list", []),
+                                "cc_list": parsed.get("cc_list", []),
+                                "date_str": parsed.get("date_str", ""),
+                                "body_text": parsed.get("body_text", ""),
+                                "body_html": parsed.get("body_html", ""),
+                                "attachments": parsed.get("attachments", []),
+                                "is_body_loaded": 1
                             }
                 except Exception:
                     pass
 
-            if parsed_email:
-                new_emails.append(parsed_email)
+                # 方式 B：mbox:readMessage JSON 回退解析
+                read_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:readMessage"
+                read_resp = session.post(
+                    read_url,
+                    json={"mid": uid, "mode": "html", "markRead": False},
+                    timeout=20.0
+                )
+                if read_resp.status_code == 200:
+                    rdata = read_resp.json()
+                    if rdata.get("code") == "S_OK":
+                        m_var = rdata.get("var", {})
+                        body_html = m_var.get("html") or m_var.get("content") or ""
+                        body_text = m_var.get("text") or ""
+                        if not body_text and body_html:
+                            body_text = re.sub(r"<[^>]+>", " ", body_html)
+                            body_text = re.sub(r"\s+", " ", body_text).strip()
 
-        return new_emails
+                        attachments = []
+                        raw_atts = m_var.get("attachments") or []
+                        if raw_atts:
+                            uid_attach_dir = os.path.join(self.attachment_root, str(uid))
+                            os.makedirs(uid_attach_dir, exist_ok=True)
+                            for att in raw_atts:
+                                aid = att.get("id") or att.get("aid")
+                                att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
+                                safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
+                                att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
+
+                                if aid is not None:
+                                    att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(str(uid))}&aid={aid}"
+                                    try:
+                                        att_resp = session.get(att_url, timeout=25.0)
+                                        if att_resp.status_code == 200:
+                                            with open(att_path, "wb") as af:
+                                                af.write(att_resp.content)
+                                            attachments.append({
+                                                "filename": safe_fname,
+                                                "filepath": att_path,
+                                                "size": len(att_resp.content)
+                                            })
+                                    except Exception:
+                                        pass
+
+                        return {
+                            "body_text": body_text,
+                            "body_html": body_html,
+                            "attachments": attachments,
+                            "is_body_loaded": 1
+                        }
+            except Exception as e:
+                if isinstance(e, ValueError) and "认证失败" in str(e):
+                    raise e
+
+        # 2. IMAP 模式
+        try:
+            conn = self._connect_imap()
+            try:
+                mailbox_arg = f'"{folder_name}"' if not folder_name.startswith('"') else folder_name
+                typ, _ = conn.select(mailbox_arg, readonly=True)
+                if typ != "OK":
+                    conn.select("INBOX", readonly=True)
+
+                typ, msg_data = conn.uid("fetch", str(uid), "(BODY.PEEK[])")
+                if typ == "OK" and msg_data and msg_data[0]:
+                    raw_bytes = msg_data[0][1]
+                    if isinstance(raw_bytes, bytes):
+                        parsed = self._parse_raw_email(str(uid), raw_bytes)
+                        if parsed:
+                            return {
+                                "subject": parsed.get("subject", ""),
+                                "sender_name": parsed.get("sender_name", ""),
+                                "sender_email": parsed.get("sender_email", ""),
+                                "to_list": parsed.get("to_list", []),
+                                "cc_list": parsed.get("cc_list", []),
+                                "date_str": parsed.get("date_str", ""),
+                                "body_text": parsed.get("body_text", ""),
+                                "body_html": parsed.get("body_html", ""),
+                                "attachments": parsed.get("attachments", []),
+                                "is_body_loaded": 1
+                            }
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        return {
+            "body_text": "",
+            "body_html": "",
+            "attachments": [],
+            "is_body_loaded": 0
+        }
+
+    def _http_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+        """全文件夹拉取完整新邮件（全量兼容）"""
+        headers, _ = self._http_fetch_new_email_headers(existing_uids, max_fetch_per_folder=max_fetch)
+        full_emails = []
+        for h in headers[:max_fetch]:
+            try:
+                detail = self.fetch_single_email_detail(h["uid"], h.get("folder_name", "INBOX"))
+                if detail.get("subject") and (not h.get("subject") or h.get("subject") == "(无主题)"):
+                    h["subject"] = detail["subject"]
+                if detail.get("sender_name") and not h.get("sender_name"):
+                    h["sender_name"] = detail["sender_name"]
+                if detail.get("sender_email") and not h.get("sender_email"):
+                    h["sender_email"] = detail["sender_email"]
+                if detail.get("to_list") and not h.get("to_list"):
+                    h["to_list"] = detail["to_list"]
+                if detail.get("cc_list") and not h.get("cc_list"):
+                    h["cc_list"] = detail["cc_list"]
+                if detail.get("date_str") and not h.get("date_str"):
+                    h["date_str"] = detail["date_str"]
+                h["body_text"] = detail.get("body_text") or h.get("body_text", "")
+                h["body_html"] = detail.get("body_html", "")
+                h["attachments"] = detail.get("attachments", [])
+                h["is_body_loaded"] = detail.get("is_body_loaded", 1)
+            except Exception:
+                pass
+            full_emails.append(h)
+        return full_emails
 
     def _http_send_email(
         self,
@@ -760,30 +951,97 @@ class CoremailClient:
             "msg": f"连接失败：未能通过任何已知协议通道登录（已测试 WebAPI、IMAP、SMTP、POP3）。请检查账号密码及内网权限。"
         }
 
-    def _imap_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
-        """通过标准 IMAP 协议拉取收件箱邮件"""
-        new_emails = []
-        conn = self._connect_imap()
+    def _imap_get_all_folders(self, conn: imaplib.IMAP4) -> List[Tuple[str, str]]:
+        """获取 IMAP 所有非系统收信文件夹 (raw_name, decoded_name)"""
+        folders = []
         try:
-            conn.select("INBOX", readonly=True)
-            typ, data = conn.uid("search", None, "ALL")
-            if typ != "OK" or not data or not data[0]:
-                return []
+            typ, data = conn.list()
+            if typ == "OK" and data:
+                for line in data:
+                    if not line:
+                        continue
+                    line_str = line.decode("latin1", errors="ignore") if isinstance(line, bytes) else str(line)
+                    m = re.search(r'"([^"]+)"$', line_str.strip())
+                    if m:
+                        raw_name = m.group(1)
+                    else:
+                        parts = line_str.strip().split()
+                        raw_name = parts[-1] if parts else "INBOX"
 
-            all_uids = [u.decode("utf-8") for u in data[0].split()]
-            candidate_uids = [u for u in all_uids[-max_fetch:] if u not in existing_uids]
+                    decoded_name = decode_imap_utf7(raw_name)
+                    if not is_system_non_inbox_folder("", decoded_name):
+                        folders.append((raw_name, decoded_name))
+        except Exception:
+            pass
 
-            for uid in candidate_uids:
+        if not any(raw.upper() == "INBOX" for raw, _ in folders):
+            folders.insert(0, ("INBOX", "收件箱"))
+        return folders
+
+    def _imap_fetch_new_email_headers(
+        self, existing_uids: set, max_fetch_per_folder: int = 25
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """通过 IMAP 多文件夹轻量扫描新邮件信头（BODY.PEEK[HEADER]，不下载正文与附件）"""
+        conn = self._connect_imap()
+        headers = []
+        folder_count = 0
+        try:
+            folders = self._imap_get_all_folders(conn)
+            folder_count = len(folders)
+            for raw_folder, decoded_folder in folders:
                 try:
-                    typ, msg_data = conn.uid("fetch", uid, "(BODY.PEEK[])")
-                    if typ != "OK" or not msg_data or not msg_data[0]:
+                    mailbox_arg = f'"{raw_folder}"' if not raw_folder.startswith('"') else raw_folder
+                    typ, _ = conn.select(mailbox_arg, readonly=True)
+                    if typ != "OK":
                         continue
-                    raw_bytes = msg_data[0][1]
-                    if not isinstance(raw_bytes, bytes):
+
+                    typ, data = conn.uid("search", None, "ALL")
+                    if typ != "OK" or not data or not data[0]:
                         continue
-                    parsed = self._parse_raw_email(uid, raw_bytes)
-                    if parsed:
-                        new_emails.append(parsed)
+
+                    all_uids = [u.decode("utf-8") for u in data[0].split()]
+                    candidate_uids = [u for u in all_uids[-max_fetch_per_folder:] if u not in existing_uids]
+
+                    for uid in candidate_uids:
+                        try:
+                            typ, msg_data = conn.uid("fetch", uid, "(BODY.PEEK[HEADER])")
+                            if typ != "OK" or not msg_data or not msg_data[0]:
+                                continue
+                            raw_header = msg_data[0][1]
+                            if not isinstance(raw_header, bytes):
+                                continue
+
+                            msg = email.message_from_bytes(raw_header)
+                            subject = decode_mime_str(msg.get("Subject", "(无主题)"))
+                            message_id = decode_mime_str(msg.get("Message-ID", ""))
+                            date_str = decode_mime_str(msg.get("Date", ""))
+
+                            from_list = parse_address_list(msg.get_all("From", []))
+                            sender_name = from_list[0]["name"] if from_list else ""
+                            sender_email = from_list[0]["email"] if from_list else ""
+
+                            to_list = parse_address_list(msg.get_all("To", []))
+                            cc_list = parse_address_list(msg.get_all("Cc", []))
+
+                            headers.append({
+                                "uid": uid,
+                                "message_id": message_id,
+                                "subject": subject,
+                                "sender_name": sender_name,
+                                "sender_email": sender_email,
+                                "to_list": to_list,
+                                "cc_list": cc_list,
+                                "date_str": date_str,
+                                "folder_name": decoded_folder,
+                                "raw_folder": raw_folder,
+                                "body_text": "",
+                                "body_html": "",
+                                "attachments": [],
+                                "is_body_loaded": 0,
+                                "is_matched": 0,
+                            })
+                        except Exception:
+                            continue
                 except Exception:
                     continue
         finally:
@@ -791,7 +1049,57 @@ class CoremailClient:
                 conn.logout()
             except Exception:
                 pass
-        return new_emails
+
+        return headers, folder_count
+
+    def fetch_new_email_headers(
+        self, existing_uids: set, max_fetch_per_folder: int = 25
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """从所有收信文件夹扫描未入库的邮件轻量信头（WebAPI -> IMAP）"""
+        if not self.email_account or not self.email_password:
+            return [], 0
+
+        # 1. Coremail WebAPI
+        if self.protocol_mode == "coremail":
+            try:
+                return self._http_fetch_new_email_headers(existing_uids, max_fetch_per_folder)
+            except Exception as http_err:
+                if isinstance(http_err, ValueError) and "认证失败" in str(http_err):
+                    raise http_err
+
+        # 2. IMAP
+        try:
+            return self._imap_fetch_new_email_headers(existing_uids, max_fetch_per_folder)
+        except Exception as imap_err:
+            raise imap_err
+
+    def _imap_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+        """通过标准 IMAP 协议拉取收件箱及自定义文件夹完整邮件"""
+        headers, _ = self._imap_fetch_new_email_headers(existing_uids, max_fetch_per_folder=max_fetch)
+        full_emails = []
+        for h in headers[:max_fetch]:
+            try:
+                detail = self.fetch_single_email_detail(h["uid"], h.get("raw_folder") or h.get("folder_name", "INBOX"))
+                if detail.get("subject") and (not h.get("subject") or h.get("subject") == "(无主题)"):
+                    h["subject"] = detail["subject"]
+                if detail.get("sender_name") and not h.get("sender_name"):
+                    h["sender_name"] = detail["sender_name"]
+                if detail.get("sender_email") and not h.get("sender_email"):
+                    h["sender_email"] = detail["sender_email"]
+                if detail.get("to_list") and not h.get("to_list"):
+                    h["to_list"] = detail["to_list"]
+                if detail.get("cc_list") and not h.get("cc_list"):
+                    h["cc_list"] = detail["cc_list"]
+                if detail.get("date_str") and not h.get("date_str"):
+                    h["date_str"] = detail["date_str"]
+                h["body_text"] = detail.get("body_text") or h.get("body_text", "")
+                h["body_html"] = detail.get("body_html", "")
+                h["attachments"] = detail.get("attachments", [])
+                h["is_body_loaded"] = detail.get("is_body_loaded", 1)
+            except Exception:
+                pass
+            full_emails.append(h)
+        return full_emails
 
     def _pop3_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
         """当 IMAP 和 WebAPI 不可用，但 POP3 端口开放时的收信兜底"""
@@ -851,7 +1159,7 @@ class CoremailClient:
         return new_emails
 
     def fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
-        """从收件箱拉取尚未入库的邮件列表（多通道智能路由：WebAPI -> IMAP -> POP3）"""
+        """从所有文件夹拉取新邮件完整列表（全量兼容接口，内部自动按需获取详情）"""
         if not self.email_account or not self.email_password:
             return []
 

@@ -5,7 +5,13 @@ from unittest.mock import patch, MagicMock
 import socket
 from PySide6.QtWidgets import QApplication
 
-from core.mail_client import normalize_host_and_port, probe_coremail_server_ports, CoremailClient
+from core.mail_client import (
+    normalize_host_and_port,
+    probe_coremail_server_ports,
+    CoremailClient,
+    decode_imap_utf7,
+    is_system_non_inbox_folder,
+)
 from ui.settings_dialog import SettingsDialog
 from ui.main_window import MainWindow
 from ui.compose_send_dialog import ComposeAndSendDialog
@@ -300,6 +306,146 @@ class TestCoremailProtocolAndUI(unittest.TestCase):
         res = client.test_connection()
         self.assertTrue(res["ok"])
         self.assertIn("WebAPI", res["msg"])
+
+    def test_decode_imap_utf7(self):
+        # ASCII folder name
+        self.assertEqual(decode_imap_utf7("INBOX"), "INBOX")
+        self.assertEqual(decode_imap_utf7("MyProject"), "MyProject")
+        # Escaped &
+        self.assertEqual(decode_imap_utf7("Research &- Development"), "Research & Development")
+        # Chinese folders (Modified UTF-7)
+        decoded = decode_imap_utf7("&V4NXPpCuTvY-")
+        self.assertTrue(len(decoded) > 0)
+        self.assertFalse(decoded.startswith("&"))
+
+    def test_is_system_non_inbox_folder(self):
+        # Should be filtered (True):
+        self.assertTrue(is_system_non_inbox_folder(2, "草稿箱"))
+        self.assertTrue(is_system_non_inbox_folder(3, "已发送"))
+        self.assertTrue(is_system_non_inbox_folder(4, "已删除"))
+        self.assertTrue(is_system_non_inbox_folder(5, "垃圾邮件"))
+        self.assertTrue(is_system_non_inbox_folder(99, "Sent Messages"))
+        self.assertTrue(is_system_non_inbox_folder(99, "Drafts"))
+        self.assertTrue(is_system_non_inbox_folder(99, "Trash"))
+        self.assertTrue(is_system_non_inbox_folder(99, "Spam"))
+        self.assertTrue(is_system_non_inbox_folder(99, "Junk"))
+
+        # Should NOT be filtered (False):
+        self.assertFalse(is_system_non_inbox_folder(1, "收件箱"))
+        self.assertFalse(is_system_non_inbox_folder("1", "INBOX"))
+        self.assertFalse(is_system_non_inbox_folder(10, "项目协同组"))
+        self.assertFalse(is_system_non_inbox_folder(11, "研发周报"))
+
+    @patch("requests.Session.post")
+    def test_multi_folder_headers_and_lazy_load(self, mock_post):
+        def post_side_effect(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "func=user:login" in url:
+                resp.json.return_value = {"code": "S_OK", "var": {"sid": "sid_multifolder"}}
+            elif "func=mbox:getAllFolders" in url:
+                resp.json.return_value = {
+                    "code": "S_OK",
+                    "var": [
+                        {"id": 1, "name": "收件箱"},
+                        {"id": 2, "name": "草稿箱"},
+                        {"id": 3, "name": "已发送"},
+                        {"id": 10, "name": "重要项目组"},
+                    ]
+                }
+            elif "func=mbox:listMessages" in url:
+                req_json = kwargs.get("json", {})
+                fid = req_json.get("fid")
+                if fid == 1:
+                    # Test dictionary variant: var={"messages": [...]}
+                    resp.json.return_value = {
+                        "code": "S_OK",
+                        "var": {
+                            "messages": [
+                                {
+                                    "id": "mid_inbox_1",
+                                    "subject": "收件箱邮件",
+                                    "from": "alice@corp.cn",
+                                    "to": ["bob@corp.cn"],
+                                    "receivedDate": 1700000000,
+                                    "summary": "来自收件箱的摘要"
+                                }
+                            ]
+                        }
+                    }
+                elif fid == 10:
+                    # Test list variant: var=[...]
+                    resp.json.return_value = {
+                        "code": "S_OK",
+                        "var": [
+                            {
+                                "id": "mid_proj_2",
+                                "subject": "紧急协调邮件",
+                                "from": "leader@corp.cn",
+                                "to": ["bob@corp.cn"],
+                                "receivedDate": 1700001000,
+                                "summary": "请尽快流转"
+                            }
+                        ]
+                    }
+                else:
+                    resp.json.return_value = {"code": "S_OK", "var": []}
+            return resp
+
+        mock_post.side_effect = post_side_effect
+
+        cfg = {
+            "protocol_mode": "coremail",
+            "coremail_server": "http://10.0.0.8",
+            "email_account": "tester@corp.cn",
+            "email_password": "pwd",
+        }
+        client = CoremailClient(cfg)
+        headers, folder_count = client.fetch_new_email_headers(existing_uids=set(), max_fetch_per_folder=5)
+        self.assertEqual(folder_count, 2)
+        self.assertEqual(len(headers), 2)
+        uids = [h["uid"] for h in headers]
+        self.assertIn("mid_inbox_1", uids)
+        self.assertIn("mid_proj_2", uids)
+
+        inbox_em = [h for h in headers if h["uid"] == "mid_inbox_1"][0]
+        proj_em = [h for h in headers if h["uid"] == "mid_proj_2"][0]
+        self.assertEqual(inbox_em["folder_name"], "收件箱")
+        self.assertEqual(inbox_em["is_body_loaded"], 0)
+        self.assertEqual(proj_em["folder_name"], "重要项目组")
+        self.assertEqual(proj_em["is_body_loaded"], 0)
+
+    @patch("requests.Session.get")
+    @patch("requests.Session.post")
+    def test_fetch_single_email_detail(self, mock_post, mock_get):
+        login_resp = MagicMock()
+        login_resp.status_code = 200
+        login_resp.json.return_value = {"code": "S_OK", "var": {"sid": "sid_detail_test"}}
+        mock_post.return_value = login_resp
+
+        eml_bytes = (
+            b"From: =?utf-8?B?5byg5LiJ?= <zhangsan@corp.cn>\r\n"
+            b"To: <tester@corp.cn>\r\n"
+            b"Subject: =?utf-8?B?5byA5Lya6YCa55+l?=\r\n"
+            b"Date: Mon, 19 Oct 2026 10:00:00 +0800\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            + "下午两点准时开会。\r\n".encode("utf-8")
+        )
+        mock_eml_resp = MagicMock()
+        mock_eml_resp.status_code = 200
+        mock_eml_resp.content = eml_bytes
+        mock_get.return_value = mock_eml_resp
+
+        cfg = {
+            "protocol_mode": "coremail",
+            "coremail_server": "http://10.0.0.8",
+            "email_account": "tester@corp.cn",
+            "email_password": "pwd",
+        }
+        client = CoremailClient(cfg, attachment_root="/tmp/test_single_att")
+        detail = client.fetch_single_email_detail("mid_test_detail", folder_name="重要项目组")
+        self.assertEqual(detail["is_body_loaded"], 1)
+        self.assertIn("下午两点准时开会", detail["body_text"])
 
 
 if __name__ == "__main__":

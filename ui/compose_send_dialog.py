@@ -200,6 +200,25 @@ class ComposeAndSendDialog(QDialog):
         return "rewrite_new" if self.btn_mode_rewrite.isChecked() else "standard_forward"
 
     def _load_initial_data(self):
+        # 0. 延迟加载防护：若邮件未预载正文附件，则现场补充拉取
+        if self.email_data.get("is_body_loaded", 1) == 0:
+            try:
+                from core.mail_client import CoremailClient
+                client = CoremailClient(self.settings)
+                detail = client.fetch_single_email_detail(
+                    uid=self.email_data.get("uid", ""),
+                    folder_name=self.email_data.get("folder_name", "INBOX")
+                )
+                self.email_data.update(detail)
+                self.db.update_email_body_and_attachments(
+                    uid=self.email_data.get("uid", ""),
+                    body_text=detail.get("body_text", ""),
+                    body_html=detail.get("body_html", ""),
+                    attachments=detail.get("attachments", [])
+                )
+            except Exception:
+                pass
+
         # 1. 选中推荐模式
         rec_mode = self.email_data.get("recommended_mode", "rewrite_new")
         if rec_mode == "standard_forward":
