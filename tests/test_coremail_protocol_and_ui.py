@@ -137,6 +137,170 @@ class TestCoremailProtocolAndUI(unittest.TestCase):
         self.assertTrue(s_dlg.coremail_box.isHidden())
         self.assertFalse(s_dlg.manual_server_box.isHidden())
 
+    @patch("socket.gethostbyname")
+    @patch("socket.create_connection")
+    def test_probe_coremail_all_ports_closed_returns_false(self, mock_connect, mock_gethost):
+        mock_gethost.return_value = "192.168.1.100"
+        mock_connect.side_effect = socket.timeout("timed out")
+
+        res = probe_coremail_server_ports("192.168.1.100")
+        self.assertFalse(res["ok"])
+        self.assertIn("超时", res["msg"])
+        self.assertNotIn("探测成功", res.get("msg", ""))
+
+    @patch("socket.gethostbyname")
+    @patch("socket.create_connection")
+    @patch("requests.Session.get")
+    def test_probe_coremail_firewall_only_http_open(self, mock_http_get, mock_connect, mock_gethost):
+        mock_gethost.return_value = "10.10.1.5"
+        def side_effect(address, timeout=1.5):
+            ip, port = address
+            if port == 80:
+                return MagicMock()
+            raise socket.timeout("timed out")
+        mock_connect.side_effect = side_effect
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_http_get.return_value = mock_resp
+
+        res = probe_coremail_server_ports("10.10.1.5")
+        self.assertTrue(res["ok"])
+        self.assertEqual(res["http_base_url"], "http://10.10.1.5")
+        self.assertIsNone(res["imap_port"])
+        self.assertIsNone(res["smtp_port"])
+        self.assertIn("HTTP/Coremail WebAPI", res["msg"])
+
+    @patch("requests.Session.post")
+    def test_coremail_client_webapi_login(self, mock_post):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "code": "S_OK",
+            "var": {"sid": "sid_test_123456"}
+        }
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "protocol_mode": "coremail",
+            "coremail_server": "http://mail.intranet.corp:8080",
+            "email_account": "tester@intranet.corp",
+            "email_password": "mypassword",
+        }
+        client = CoremailClient(cfg)
+        base_url, sid = client._http_login()
+        self.assertEqual(sid, "sid_test_123456")
+        self.assertEqual(base_url, "http://mail.intranet.corp:8080")
+
+    @patch("requests.Session.post")
+    @patch("requests.Session.get")
+    def test_coremail_client_webapi_fetch_new_emails_eml(self, mock_get, mock_post):
+        def post_side_effect(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "func=user:login" in url:
+                resp.json.return_value = {"code": "S_OK", "var": {"sid": "sid_xyz"}}
+            elif "func=mbox:listMessages" in url:
+                resp.json.return_value = {
+                    "code": "S_OK",
+                    "var": [{"id": "mid_1001"}]
+                }
+            return resp
+        mock_post.side_effect = post_side_effect
+
+        eml_bytes = (
+            b"From: =?utf-8?B?5byg5LiJ?= <zhangsan@corp.cn>\r\n"
+            b"To: <tester@corp.cn>\r\n"
+            b"Subject: =?utf-8?B?5rWL6K+V6YKu5Lu2?=\r\n"
+            b"Date: Mon, 19 Oct 2026 10:00:00 +0800\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n\r\n"
+            b"Hello via Coremail WebAPI EML!\r\n"
+        )
+        mock_eml_resp = MagicMock()
+        mock_eml_resp.status_code = 200
+        mock_eml_resp.content = eml_bytes
+        mock_get.return_value = mock_eml_resp
+
+        cfg = {
+            "protocol_mode": "coremail",
+            "coremail_server": "http://10.0.0.8",
+            "email_account": "tester@corp.cn",
+            "email_password": "pwd",
+        }
+        client = CoremailClient(cfg, attachment_root="/tmp/test_att")
+        emails = client.fetch_new_emails(existing_uids=set(), max_fetch=10)
+        self.assertEqual(len(emails), 1)
+        self.assertEqual(emails[0]["uid"], "mid_1001")
+        self.assertEqual(emails[0]["subject"], "测试邮件")
+        self.assertEqual(emails[0]["sender_name"], "张三")
+        self.assertEqual(emails[0]["sender_email"], "zhangsan@corp.cn")
+        self.assertIn("Hello via Coremail WebAPI EML!", emails[0]["body_text"])
+
+    @patch("requests.Session.post")
+    def test_coremail_client_webapi_send_email(self, mock_post):
+        def post_side_effect(url, **kwargs):
+            resp = MagicMock()
+            resp.status_code = 200
+            if "func=user:login" in url:
+                resp.json.return_value = {"code": "S_OK", "var": {"sid": "sid_compose_test"}}
+            elif "func=mbox:compose" in url:
+                resp.json.return_value = {"code": "S_OK", "var": {"id": "sent_1"}}
+            return resp
+        mock_post.side_effect = post_side_effect
+
+        cfg = {
+            "protocol_mode": "coremail",
+            "coremail_server": "http://10.0.0.8",
+            "email_account": "tester@corp.cn",
+            "email_password": "pwd",
+        }
+        client = CoremailClient(cfg)
+        client.send_email(
+            to_addrs=["target@corp.cn"],
+            cc_addrs=["cc@corp.cn"],
+            subject="自动化通知",
+            html_body="<p>内容已送达</p>",
+            plain_body="内容已送达",
+            attachment_paths=[],
+            save_to_sent=True
+        )
+        self.assertTrue(mock_post.called)
+        calls = [c for c in mock_post.call_args_list if "func=mbox:compose" in c[0][0]]
+        self.assertEqual(len(calls), 1)
+        payload = calls[0][1]["json"]
+        self.assertEqual(payload["attrs"]["subject"], "自动化通知")
+        self.assertEqual(payload["attrs"]["to"], ["target@corp.cn"])
+
+    @patch("core.mail_client.probe_coremail_server_ports")
+    @patch("requests.Session.post")
+    def test_coremail_client_test_connection_firewall_webapi(self, mock_post, mock_probe):
+        mock_probe.return_value = {
+            "ok": True,
+            "host": "10.0.0.8",
+            "resolved_ip": "10.0.0.8",
+            "http_base_url": "http://10.0.0.8:8080",
+            "imap_port": None,
+            "imap_ssl": False,
+            "smtp_port": None,
+            "smtp_ssl": False,
+            "open_channels": ["HTTP/Coremail WebAPI (http://10.0.0.8:8080)"],
+            "msg": "探测成功"
+        }
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"code": "S_OK", "var": {"sid": "sid_conn_123"}}
+        mock_post.return_value = mock_resp
+
+        cfg = {
+            "protocol_mode": "coremail",
+            "coremail_server": "http://10.0.0.8:8080",
+            "email_account": "tester@corp.cn",
+            "email_password": "pwd",
+        }
+        client = CoremailClient(cfg)
+        res = client.test_connection()
+        self.assertTrue(res["ok"])
+        self.assertIn("WebAPI", res["msg"])
+
 
 if __name__ == "__main__":
     unittest.main()

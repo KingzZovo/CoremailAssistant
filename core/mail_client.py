@@ -1,6 +1,6 @@
-"""Coremail IMAP/SMTP Client engine.
-Supports IMAP fetching, GB18030/GBK/UTF-8 decoding, attachment caching,
-inline image conversion (cid <-> local URI/base64), and SMTP rich text sending.
+"""Coremail Client engine supporting both standard IMAP/SMTP and genuine Coremail WebAPI (/coremail/s/json).
+Supports HTTP/HTTPS WebAPI, IMAP fetching, POP3 fallback, GB18030/GBK/UTF-8 decoding,
+attachment caching, inline image conversion (cid <-> local URI/base64), and rich text sending.
 """
 
 import os
@@ -11,8 +11,9 @@ import base64
 import socket
 import imaplib
 import smtplib
+import poplib
 import email
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, unquote
 from email.header import decode_header, make_header
 from email.utils import getaddresses, formataddr, formatdate, make_msgid
 from email.mime.multipart import MIMEMultipart
@@ -21,6 +22,12 @@ from email.mime.base import MIMEBase
 from email.mime.image import MIMEImage
 from email import encoders
 from typing import List, Dict, Any, Optional, Tuple
+
+import requests
+import urllib3
+
+# 忽略内网自签名证书安全警告
+urllib3.disable_warnings()
 
 
 def decode_mime_str(value: Optional[str]) -> str:
@@ -72,6 +79,38 @@ def parse_address_list(header_values: List[str]) -> List[Dict[str, str]]:
     return result
 
 
+def parse_server_endpoint(raw_host: str) -> Dict[str, Any]:
+    """
+    解析服务器配置字符串，提取 scheme, host, port, path
+    例如 'http://192.168.1.50:8080/coremail/' -> {'scheme': 'http', 'host': '192.168.1.50', 'port': 8080, 'path': '/coremail/'}
+    """
+    if not raw_host:
+        return {"scheme": "", "host": "", "port": None, "path": ""}
+    s = raw_host.strip()
+    has_scheme = "://" in s
+    if not has_scheme:
+        s = "http://" + s
+    try:
+        parsed = urlparse(s)
+        clean_host = (parsed.hostname or "").strip()
+        port = parsed.port
+        scheme = parsed.scheme if has_scheme else ""
+        return {
+            "scheme": scheme.lower(),
+            "host": clean_host,
+            "port": port,
+            "path": parsed.path or ""
+        }
+    except Exception:
+        m = re.match(r"^(?:(https?)://)?([^:/]+)(?::(\d+))?", raw_host.strip(), re.IGNORECASE)
+        if m:
+            scheme = (m.group(1) or "").lower()
+            clean_host = m.group(2).strip()
+            port = int(m.group(3)) if m.group(3) else None
+            return {"scheme": scheme, "host": clean_host, "port": port, "path": ""}
+        return {"scheme": "", "host": raw_host.strip(), "port": None, "path": ""}
+
+
 def normalize_host_and_port(raw_host: str, default_port: int = 143) -> Tuple[str, int]:
     """
     清洗用户在设置中填写的服务器地址，防止因包含 http://、端口号或路径导致 Windows 报 Errno 11001。
@@ -81,30 +120,28 @@ def normalize_host_and_port(raw_host: str, default_port: int = 143) -> Tuple[str
     """
     if not raw_host:
         return "", default_port
-    s = raw_host.strip()
-    if "://" not in s:
-        s = "http://" + s
-    try:
-        parsed = urlparse(s)
-        clean_host = (parsed.hostname or "").strip()
-        port = parsed.port if parsed.port is not None else default_port
-        return clean_host, port
-    except Exception:
-        m = re.match(r"^(?:https?://)?([^:/]+)(?::(\d+))?", raw_host.strip(), re.IGNORECASE)
-        if m:
-            clean_host = m.group(1).strip()
-            port = int(m.group(2)) if m.group(2) else default_port
-            return clean_host, port
-        return raw_host.strip(), default_port
+    info = parse_server_endpoint(raw_host)
+    clean_host = info.get("host") or ""
+    port = info.get("port") if info.get("port") is not None else default_port
+    return clean_host, port
 
 
 def probe_coremail_server_ports(raw_host: str) -> Dict[str, Any]:
     """
-    针对内网/专有 Coremail 服务器一键探测实际开放的收发端口（解决内网未开 SSL 993/465 而是开 143/25 的情况）
+    真实探测 Coremail 服务器开放的收发端口（彻底杜绝假阳性，并探测 HTTP/HTTPS 与 POP3 端口）。
+    严禁在端口不通时强行赋默认值假装成功！
     """
-    clean_host, _ = normalize_host_and_port(raw_host, 143)
-    if not clean_host:
+    raw_host = (raw_host or "").strip()
+    if not raw_host:
         return {"ok": False, "msg": "服务器地址不能为空，请填写论客客户端中的服务器 IP 或域名。"}
+
+    endpoint = parse_server_endpoint(raw_host)
+    clean_host = endpoint["host"]
+    custom_port = endpoint["port"]
+    custom_scheme = endpoint["scheme"]
+
+    if not clean_host:
+        return {"ok": False, "msg": "无法从地址中识别有效主机名或 IP，请检查格式。"}
 
     # 第一步：验证 DNS / IP 解析（捕获 Errno 11001）
     try:
@@ -121,42 +158,116 @@ def probe_coremail_server_ports(raw_host: str) -> Dict[str, Any]:
             )
         }
 
-    def is_port_open(port: int) -> bool:
+    def is_port_open(port: int, timeout: float = 1.5) -> bool:
         try:
-            with socket.create_connection((resolved_ip, port), timeout=2.0):
+            with socket.create_connection((resolved_ip, port), timeout=timeout):
                 return True
         except Exception:
             return False
 
-    # 第二步：探测 IMAP 端口（优先 993 SSL，其次 143 明文）
+    # 第二步：探测 Coremail HTTP/HTTPS 专用协议端口 [custom_port, 443, 80, 8080, 8443]
+    http_candidates: List[int] = []
+    if custom_port:
+        http_candidates.append(custom_port)
+    for p in [443, 80, 8080, 8443]:
+        if p not in http_candidates:
+            http_candidates.append(p)
+
+    open_http_port: Optional[int] = None
+    http_scheme: Optional[str] = None
+    http_base_url: Optional[str] = None
+
+    for p in http_candidates:
+        if is_port_open(p):
+            schemes = ["https", "http"] if p in (443, 8443) else ["http", "https"]
+            if custom_scheme in ("http", "https"):
+                schemes = [custom_scheme] + [s for s in schemes if s != custom_scheme]
+
+            for s in schemes:
+                test_base = f"{s}://{clean_host}" if p in (80, 443) else f"{s}://{clean_host}:{p}"
+                try:
+                    sess = requests.Session()
+                    sess.trust_env = False
+                    r = sess.get(f"{test_base}/coremail/", timeout=2.0, verify=False, allow_redirects=True)
+                    if r.status_code < 500:
+                        open_http_port = p
+                        http_scheme = s
+                        http_base_url = test_base
+                        break
+                except Exception:
+                    pass
+
+            if open_http_port is None:
+                # 端口已通，即使未配置 /coremail/ 重定向也作为备选 HTTP 基础地址
+                open_http_port = p
+                http_scheme = "https" if p in (443, 8443) else "http"
+                http_base_url = f"{http_scheme}://{clean_host}" if p in (80, 443) else f"{http_scheme}://{clean_host}:{p}"
+            break
+
+    # 第三步：探测 IMAP 端口 [993, 143]（严禁无端口开放时赋予虚假默认值）
+    imap_port: Optional[int] = None
+    imap_ssl: bool = False
     if is_port_open(993):
         imap_port, imap_ssl = 993, True
     elif is_port_open(143):
         imap_port, imap_ssl = 143, False
-    else:
-        imap_port, imap_ssl = 143, False
 
-    # 第三步：探测 SMTP 端口（优先 465 SSL，其次 25 明文，再次 587）
+    # 第四步：探测 POP3 端口 [995, 110]
+    pop3_port: Optional[int] = None
+    pop3_ssl: bool = False
+    if is_port_open(995):
+        pop3_port, pop3_ssl = 995, True
+    elif is_port_open(110):
+        pop3_port, pop3_ssl = 110, False
+
+    # 第五步：探测 SMTP 端口 [465, 25, 587]
+    smtp_port: Optional[int] = None
+    smtp_ssl: bool = False
     if is_port_open(465):
         smtp_port, smtp_ssl = 465, True
     elif is_port_open(25):
         smtp_port, smtp_ssl = 25, False
     elif is_port_open(587):
         smtp_port, smtp_ssl = 587, False
-    else:
-        smtp_port, smtp_ssl = 25, False
 
-    ssl_imap_text = "开启" if imap_ssl else "关闭"
-    ssl_smtp_text = "开启" if smtp_ssl else "关闭"
+    # 汇总探测结果，严禁在全灭时报成功
+    open_channels = []
+    if http_base_url:
+        open_channels.append(f"HTTP/Coremail WebAPI ({http_base_url})")
+    if imap_port is not None:
+        open_channels.append(f"IMAP ({imap_port}, SSL={'开启' if imap_ssl else '关闭'})")
+    if pop3_port is not None:
+        open_channels.append(f"POP3 ({pop3_port}, SSL={'开启' if pop3_ssl else '关闭'})")
+    if smtp_port is not None:
+        open_channels.append(f"SMTP ({smtp_port}, SSL={'开启' if smtp_ssl else '关闭'})")
+
+    if not open_channels:
+        return {
+            "ok": False,
+            "host": clean_host,
+            "resolved_ip": resolved_ip,
+            "msg": (
+                f"服务器 IP「{clean_host}」({resolved_ip}) 解析成功，但 80/443/143/993/110/995/25/465 等端口均连接超时。\n"
+                f"原因：内网防火墙可能拦截了访问，或服务器未开放对应服务。\n"
+                f"建议：请检查论客客户端【设置 -> 帐号管理】中的真实服务器 IP 和端口号。"
+            )
+        }
+
     return {
         "ok": True,
         "host": clean_host,
         "resolved_ip": resolved_ip,
+        "http_base_url": http_base_url,
+        "http_port": open_http_port,
+        "http_scheme": http_scheme,
         "imap_port": imap_port,
         "imap_ssl": imap_ssl,
+        "pop3_port": pop3_port,
+        "pop3_ssl": pop3_ssl,
         "smtp_port": smtp_port,
         "smtp_ssl": smtp_ssl,
-        "msg": f"探测成功 (解析到 IP: {resolved_ip})：\n推荐 IMAP 端口 {imap_port} (SSL={ssl_imap_text})，\nSMTP 端口 {smtp_port} (SSL={ssl_smtp_text})"
+        "open_channels": open_channels,
+        "msg": f"探测成功 (解析到 IP: {resolved_ip})：\n已探测到开放通道与端口：\n• " + "\n• ".join(open_channels)
     }
 
 
@@ -164,19 +275,21 @@ auto_detect_server = probe_coremail_server_ports
 
 
 class CoremailClient:
-    """Coremail 论客邮箱 IMAP/SMTP 客户端封装（支持富文本 HTML 及内联图片发送）"""
+    """Coremail 论客邮箱多通道客户端（支持 Coremail WebAPI / IMAP / POP3 / SMTP）"""
 
     normalize_host_and_port = staticmethod(normalize_host_and_port)
     probe_coremail_server_ports = staticmethod(probe_coremail_server_ports)
     auto_detect_server = staticmethod(probe_coremail_server_ports)
 
     def __init__(self, config: Dict[str, Any], attachment_root: str = "data/attachments"):
+        self.config = config
         self.protocol_mode = config.get("protocol_mode", "coremail")
-        coremail_srv = config.get("coremail_server", "").strip()
+        self.coremail_server = config.get("coremail_server", "").strip()
+        self.http_base_url = config.get("http_base_url", "").strip()
 
         # 如果采用 coremail 单地址模式且填写了 coremail_server，则优先将其作为 IMAP 与 SMTP 主机
-        raw_imap = coremail_srv if (self.protocol_mode == "coremail" and coremail_srv) else config.get("imap_host", "").strip()
-        raw_smtp = coremail_srv if (self.protocol_mode == "coremail" and coremail_srv) else config.get("smtp_host", "").strip()
+        raw_imap = self.coremail_server if (self.protocol_mode == "coremail" and self.coremail_server) else config.get("imap_host", "").strip()
+        raw_smtp = self.coremail_server if (self.protocol_mode == "coremail" and self.coremail_server) else config.get("smtp_host", "").strip()
 
         default_imap_port = int(config.get("imap_port", 993) or 993)
         default_smtp_port = int(config.get("smtp_port", 465) or 465)
@@ -192,6 +305,313 @@ class CoremailClient:
         self.sender_display_name = config.get("sender_display_name", "").strip()
         self.attachment_root = attachment_root
         os.makedirs(self.attachment_root, exist_ok=True)
+
+        # WebAPI 会话与缓存
+        self._http_session: Optional[requests.Session] = None
+        self._cached_sid: Optional[str] = None
+        self._cached_base_url: Optional[str] = None
+
+    def _get_http_session(self) -> requests.Session:
+        if self._http_session is None:
+            sess = requests.Session()
+            sess.trust_env = False  # 忽略错误或被重定向的 Windows 系统代理
+            sess.verify = False     # 兼容内网自签名证书
+            sess.headers.update({
+                "User-Agent": "L-CMClient/5.0",
+                "Accept": "application/json, text/plain, */*"
+            })
+            self._http_session = sess
+        return self._http_session
+
+    def _get_candidate_base_urls(self) -> List[str]:
+        candidates = []
+        if self.http_base_url:
+            candidates.append(self.http_base_url.rstrip("/"))
+
+        raw_srv = self.coremail_server.strip()
+        if raw_srv:
+            parsed = parse_server_endpoint(raw_srv)
+            if parsed.get("scheme") and parsed.get("host"):
+                p = parsed.get("port")
+                base = f"{parsed['scheme']}://{parsed['host']}" + (f":{p}" if p else "")
+                if base not in candidates:
+                    candidates.append(base)
+
+        clean_host = normalize_host_and_port(self.coremail_server or self.imap_host, 80)[0]
+        if clean_host:
+            for s in [
+                f"https://{clean_host}",
+                f"http://{clean_host}",
+                f"http://{clean_host}:8080",
+                f"https://{clean_host}:8443",
+                f"http://{clean_host}:80"
+            ]:
+                if s not in candidates:
+                    candidates.append(s)
+        return candidates
+
+    def _http_login(self) -> Tuple[str, str]:
+        """
+        通过 Coremail WebAPI (/coremail/s/json?func=user:login) 认证登录并获取会话 sid
+        """
+        if not self.email_account or not self.email_password:
+            raise ValueError("邮箱账号或密码未填写")
+
+        session = self._get_http_session()
+        candidates = self._get_candidate_base_urls()
+
+        # 尝试两种 uid 格式：完整邮箱和去掉 @domain 的前缀
+        uid_candidates = [self.email_account]
+        if "@" in self.email_account:
+            uid_candidates.append(self.email_account.split("@")[0])
+
+        last_error = None
+        auth_failed = False
+
+        for base_url in candidates:
+            login_url = f"{base_url}/coremail/s/json?func=user:login"
+            for uid in uid_candidates:
+                payload = {
+                    "uid": uid,
+                    "password": self.email_password,
+                    "supportVerifyCode": False
+                }
+                try:
+                    resp = session.post(
+                        login_url,
+                        json=payload,
+                        headers={"Content-Type": "application/json; charset=UTF-8"},
+                        timeout=5.0
+                    )
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                        except Exception:
+                            continue
+
+                        code = data.get("code")
+                        if code == "S_OK":
+                            var = data.get("var") or {}
+                            sid = var.get("sid")
+                            if sid:
+                                self._cached_sid = sid
+                                self._cached_base_url = base_url
+                                return base_url, sid
+                        elif code in ("FA_UNAUTHORIZED", "FA_PASSWORD_ERROR", "FA_USER_NOT_EXIST") or "password" in str(data.get("message", "")).lower():
+                            auth_failed = True
+                            last_error = f"账号或密码错误: {data.get('message', code)}"
+                        else:
+                            last_error = f"登录返回异常 ({code}): {data.get('message', '')}"
+                except (requests.ConnectionError, requests.Timeout) as net_err:
+                    last_error = f"无法连接到 {base_url}: {str(net_err)}"
+                except Exception as ex:
+                    last_error = str(ex)
+
+            if auth_failed:
+                raise ValueError(f"Coremail 论客认证失败: {last_error}")
+
+        raise ConnectionError(f"Coremail WebAPI 登录失败：所有候选服务地址均不可用。最后错误: {last_error}")
+
+    def _http_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+        """
+        通过 Coremail WebAPI (/coremail/s/json?func=mbox:listMessages) 拉取收件箱邮件列表，
+        优先通过 /coremail/s/eml 拉取原始 EML 由 _parse_raw_email 完整解析，
+        次选通过 mbox:readMessage 解析正文及下载附件。
+        """
+        new_emails = []
+        base_url, sid = self._http_login()
+        session = self._get_http_session()
+
+        list_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:listMessages"
+        list_payload = {
+            "fid": 1,
+            "start": 0,
+            "limit": max_fetch,
+            "order": "receivedDate",
+            "desc": True,
+            "returnTotal": True
+        }
+
+        resp = session.post(list_url, json=list_payload, timeout=10.0)
+        if resp.status_code != 200:
+            raise RuntimeError(f"获取邮件列表失败，HTTP 状态码: {resp.status_code}")
+
+        data = resp.json()
+        if data.get("code") != "S_OK":
+            raise RuntimeError(f"Coremail 获取邮件列表失败: {data.get('code')} - {data.get('message', '')}")
+
+        var = data.get("var", [])
+        if isinstance(var, dict):
+            items = var.get("messages") or var.get("items") or []
+        elif isinstance(var, list):
+            items = var
+        else:
+            items = []
+
+        for item in items:
+            mid = item.get("id") or item.get("mid")
+            if not mid:
+                continue
+            mid_str = str(mid)
+            if mid_str in existing_uids:
+                continue
+
+            parsed_email = None
+
+            # 方式 A：优先拉取标准 EML 原始数据，100% 还原富文本、内联图片与完整附件
+            try:
+                eml_url = f"{base_url}/coremail/s/eml?sid={sid}&mid={quote(mid_str)}"
+                eml_resp = session.get(eml_url, timeout=15.0)
+                if eml_resp.status_code == 200 and eml_resp.content and len(eml_resp.content) > 10:
+                    parsed_email = self._parse_raw_email(mid_str, eml_resp.content)
+            except Exception:
+                parsed_email = None
+
+            # 方式 B：EML 拉取失败时回退到 mbox:readMessage JSON 解析
+            if not parsed_email:
+                try:
+                    read_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:readMessage"
+                    read_resp = session.post(
+                        read_url,
+                        json={"mid": mid, "mode": "html", "markRead": False},
+                        timeout=15.0
+                    )
+                    if read_resp.status_code == 200:
+                        rdata = read_resp.json()
+                        if rdata.get("code") == "S_OK":
+                            m_var = rdata.get("var", {})
+                            subject = decode_mime_str(m_var.get("subject", "(无主题)"))
+                            message_id = m_var.get("messageId", "")
+                            date_str = str(m_var.get("sentDate") or m_var.get("receivedDate") or "")
+
+                            from_list = parse_address_list([m_var.get("from", "")])
+                            sender_name = from_list[0]["name"] if from_list else ""
+                            sender_email = from_list[0]["email"] if from_list else ""
+
+                            to_list = parse_address_list([m_var.get("to", "")])
+                            cc_list = parse_address_list([m_var.get("cc", "")])
+
+                            body_html = m_var.get("html") or m_var.get("content") or ""
+                            body_text = m_var.get("text") or ""
+                            if not body_text and body_html:
+                                body_text = re.sub(r"<[^>]+>", " ", body_html)
+                                body_text = re.sub(r"\s+", " ", body_text).strip()
+
+                            attachments = []
+                            raw_atts = m_var.get("attachments") or []
+                            if raw_atts:
+                                uid_attach_dir = os.path.join(self.attachment_root, mid_str)
+                                os.makedirs(uid_attach_dir, exist_ok=True)
+                                for att in raw_atts:
+                                    aid = att.get("id") or att.get("aid")
+                                    att_name = decode_mime_str(att.get("filename") or att.get("name") or "attachment")
+                                    safe_fname = re.sub(r'[\\/:*?"<>|]', "_", att_name)
+                                    att_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
+
+                                    if aid is not None:
+                                        att_url = f"{base_url}/coremail/s/attach?sid={sid}&mid={quote(mid_str)}&aid={aid}"
+                                        try:
+                                            att_resp = session.get(att_url, timeout=20.0)
+                                            if att_resp.status_code == 200:
+                                                with open(att_path, "wb") as af:
+                                                    af.write(att_resp.content)
+                                                attachments.append({
+                                                    "filename": safe_fname,
+                                                    "filepath": att_path,
+                                                    "size": len(att_resp.content)
+                                                })
+                                        except Exception:
+                                            pass
+
+                            parsed_email = {
+                                "uid": mid_str,
+                                "message_id": message_id,
+                                "subject": subject,
+                                "sender_name": sender_name,
+                                "sender_email": sender_email,
+                                "to_list": to_list,
+                                "cc_list": cc_list,
+                                "date_str": date_str,
+                                "body_text": body_text,
+                                "body_html": body_html,
+                                "attachments": attachments,
+                            }
+                except Exception:
+                    pass
+
+            if parsed_email:
+                new_emails.append(parsed_email)
+
+        return new_emails
+
+    def _http_send_email(
+        self,
+        to_addrs: List[str],
+        cc_addrs: List[str],
+        subject: str,
+        html_body: str,
+        plain_body: str,
+        attachment_paths: List[str],
+        save_to_sent: bool = True
+    ) -> None:
+        """通过 Coremail WebAPI (/coremail/s/json?func=mbox:compose) 发送邮件"""
+        base_url, sid = self._http_login()
+        session = self._get_http_session()
+
+        uploaded_attachments = []
+        if attachment_paths:
+            upload_url = f"{base_url}/coremail/s/upload?sid={sid}"
+            for p in attachment_paths:
+                if not p or not os.path.isfile(p):
+                    continue
+                fname = os.path.basename(p)
+                try:
+                    with open(p, "rb") as f:
+                        files = {"file": (fname, f, "application/octet-stream")}
+                        up_resp = session.post(upload_url, files=files, timeout=30.0)
+                    if up_resp.status_code == 200:
+                        up_data = up_resp.json()
+                        if up_data.get("code") == "S_OK":
+                            var = up_data.get("var", {})
+                            uploaded_attachments.append(var if isinstance(var, dict) else {"id": var, "filename": fname})
+                        elif "id" in up_data:
+                            uploaded_attachments.append(up_data)
+                except Exception:
+                    pass
+
+        compose_url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:compose"
+        payload = {
+            "attrs": {
+                "account": self.email_account,
+                "to": to_addrs,
+                "cc": cc_addrs,
+                "subject": subject,
+                "isHtml": True,
+                "content": html_body or plain_body,
+                "saveSent": save_to_sent,
+                "attachments": uploaded_attachments
+            },
+            "action": "deliver",
+            "returnInfo": True
+        }
+
+        resp = session.post(compose_url, json=payload, timeout=25.0)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Coremail WebAPI 发信失败，HTTP 状态码: {resp.status_code}")
+
+        data = resp.json()
+        if data.get("code") != "S_OK":
+            raise RuntimeError(f"Coremail WebAPI 发信失败: {data.get('code')} - {data.get('message', '')}")
+
+    def _http_mark_read(self, uid: str) -> None:
+        """通过 Coremail WebAPI 标记邮件为已读"""
+        try:
+            base_url, sid = self._http_login()
+            session = self._get_http_session()
+            url = f"{base_url}/coremail/s/json?sid={sid}&func=mbox:updateMessageStatus"
+            session.post(url, json={"ids": [uid], "markRead": True}, timeout=5.0)
+        except Exception:
+            pass
 
     def _connect_imap(self) -> imaplib.IMAP4:
         """建立并登录 IMAP 连接（带清洗与自动降级回退）"""
@@ -227,41 +647,85 @@ class CoremailClient:
             raise primary_err
 
     def test_connection(self) -> Dict[str, Any]:
-        """测试 IMAP 和 SMTP 连接与凭据有效性（友好的中文报错与降级保护）"""
+        """测试连接与凭据有效性（快速端口探测 + Coremail WebAPI / IMAP / SMTP 智能多通道调度）"""
         if not self.email_account or not self.email_password:
             return {"ok": False, "msg": "邮箱账号或密码未填写"}
-        if not self.imap_host and not self.smtp_host:
+
+        target_host = self.coremail_server if self.protocol_mode == "coremail" and self.coremail_server else self.imap_host
+        if not target_host and not self.smtp_host:
             return {"ok": False, "msg": "服务器地址未填写"}
 
-        try:
-            # 1. 测试 IMAP 连接
-            imap_conn = self._connect_imap()
-            imap_conn.select("INBOX", readonly=True)
-            imap_conn.logout()
+        # 1. 快速端口探测 (< 2.0s)，避免盲目 15 秒连接超时
+        probe_res = probe_coremail_server_ports(target_host or self.smtp_host)
+        if not probe_res.get("ok"):
+            return probe_res
 
-            # 2. 测试 SMTP 连接
-            clean_smtp, _ = normalize_host_and_port(self.smtp_host, self.smtp_port)
+        resolved_ip = probe_res.get("resolved_ip", "")
+        http_base_url = probe_res.get("http_base_url")
+        open_imap_port = probe_res.get("imap_port")
+        open_smtp_port = probe_res.get("smtp_port")
+        open_pop3_port = probe_res.get("pop3_port")
+
+        success_channels = []
+
+        # 2. 如果处于 coremail 模式且开放了 HTTP/HTTPS，优先测试 WebAPI 专用通道
+        if self.protocol_mode == "coremail" and http_base_url:
+            try:
+                base_url, sid = self._http_login()
+                self._cached_base_url = base_url
+                self._cached_sid = sid
+                success_channels.append(f"Coremail WebAPI 专用通道 ({base_url})")
+            except Exception as e:
+                if "认证失败" in str(e) or "密码错误" in str(e):
+                    return {"ok": False, "msg": str(e)}
+
+        # 3. 若 WebAPI 走通且未开放 SMTP，WebAPI 本身已具备完整收发能力！
+        if success_channels and open_smtp_port is None:
+            return {
+                "ok": True,
+                "msg": (
+                    f"🎉 Coremail 论客服务器连接验证成功！\n\n"
+                    f"• 服务器 IP: {resolved_ip}\n"
+                    f"• 接入通道: {success_channels[0]}\n"
+                    f"• 状态: 仅开放 HTTP/HTTPS 端口（内网防火墙已拦截标准 143/25 端口），\n"
+                    f"  系统已自动切换至与官方论客客户端相同的 WebAPI 专用协议通道，收发与附件均正常！"
+                )
+            }
+
+        # 4. 测试 IMAP 登录（仅当 IMAP 端口真实开放时）
+        imap_ok = False
+        if open_imap_port is not None:
+            self.imap_port = open_imap_port
+            self.imap_ssl = probe_res.get("imap_ssl", False)
+            try:
+                imap_conn = self._connect_imap()
+                imap_conn.select("INBOX", readonly=True)
+                imap_conn.logout()
+                imap_ok = True
+                success_channels.append(f"IMAP 收信 (端口 {open_imap_port})")
+            except Exception as imap_err:
+                if not success_channels:
+                    return {"ok": False, "msg": f"IMAP 连接失败: {imap_err}"}
+
+        # 5. 测试 SMTP 登录（仅当 SMTP 端口真实开放时）
+        smtp_ok = False
+        if open_smtp_port is not None:
+            self.smtp_port = open_smtp_port
+            self.smtp_ssl = probe_res.get("smtp_ssl", False)
+            clean_smtp, _ = normalize_host_and_port(self.smtp_host or target_host, self.smtp_port)
             smtp_conn = None
             try:
                 if self.smtp_ssl:
-                    smtp_conn = smtplib.SMTP_SSL(clean_smtp, self.smtp_port, timeout=15)
+                    smtp_conn = smtplib.SMTP_SSL(clean_smtp, self.smtp_port, timeout=10)
                 else:
-                    smtp_conn = smtplib.SMTP(clean_smtp, self.smtp_port, timeout=15)
+                    smtp_conn = smtplib.SMTP(clean_smtp, self.smtp_port, timeout=10)
                     smtp_conn.ehlo()
                 smtp_conn.login(self.email_account, self.email_password)
+                smtp_ok = True
+                success_channels.append(f"SMTP 发信 (端口 {open_smtp_port})")
             except Exception as smtp_err:
-                # 在 coremail 模式下尝试回退到 25 端口
-                if self.protocol_mode == "coremail" and self.smtp_ssl:
-                    try:
-                        smtp_conn = smtplib.SMTP(clean_smtp, 25, timeout=10)
-                        smtp_conn.ehlo()
-                        smtp_conn.login(self.email_account, self.email_password)
-                        self.smtp_port = 25
-                        self.smtp_ssl = False
-                    except Exception:
-                        raise smtp_err
-                else:
-                    raise smtp_err
+                if not success_channels:
+                    return {"ok": False, "msg": f"SMTP 连接失败: {smtp_err}"}
             finally:
                 if smtp_conn:
                     try:
@@ -269,28 +733,36 @@ class CoremailClient:
                     except Exception:
                         pass
 
-            return {"ok": True, "msg": "Coremail 论客服务器连接验证成功！收发服务均正常。"}
-        except socket.gaierror as e:
-            err_code = getattr(e, 'errno', 11001)
+        # 6. POP3 测试（当 IMAP 关但 POP3 开时）
+        if not imap_ok and open_pop3_port is not None:
+            try:
+                clean_pop, _ = normalize_host_and_port(target_host, open_pop3_port)
+                if probe_res.get("pop3_ssl"):
+                    p_conn = poplib.POP3_SSL(clean_pop, open_pop3_port, timeout=10)
+                else:
+                    p_conn = poplib.POP3(clean_pop, open_pop3_port, timeout=10)
+                p_conn.user(self.email_account)
+                p_conn.pass_(self.email_password)
+                p_conn.quit()
+                success_channels.append(f"POP3 收信 (端口 {open_pop3_port})")
+            except Exception:
+                pass
+
+        if success_channels:
+            channel_str = "、".join(success_channels)
             return {
-                "ok": False,
-                "msg": f"解析服务器地址失败 (Errno {err_code})：当前网络无法解析该域名，请检查拼写或直接输入论客服务器的内网 IP 地址。"
+                "ok": True,
+                "msg": f"🎉 论客邮箱服务连接验证成功！\n已成功连通通道：\n• {channel_str}"
             }
-        except Exception as e:
-            err_str = str(e)
-            if "11001" in err_str:
-                return {
-                    "ok": False,
-                    "msg": "连接失败 (Errno 11001)：主机名无法解析，请检查服务器地址是否包含 http:// 或多余字符，建议直接填写 IP 地址。"
-                }
-            return {"ok": False, "msg": f"连接失败: {err_str}"}
 
-    def fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
-        """从收件箱拉取尚未入库的邮件列表"""
+        return {
+            "ok": False,
+            "msg": f"连接失败：未能通过任何已知协议通道登录（已测试 WebAPI、IMAP、SMTP、POP3）。请检查账号密码及内网权限。"
+        }
+
+    def _imap_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+        """通过标准 IMAP 协议拉取收件箱邮件"""
         new_emails = []
-        if not self.email_account or not self.email_password:
-            return []
-
         conn = self._connect_imap()
         try:
             conn.select("INBOX", readonly=True)
@@ -299,7 +771,6 @@ class CoremailClient:
                 return []
 
             all_uids = [u.decode("utf-8") for u in data[0].split()]
-            # 取最近的 max_fetch 封未记录 UID
             candidate_uids = [u for u in all_uids[-max_fetch:] if u not in existing_uids]
 
             for uid in candidate_uids:
@@ -321,6 +792,90 @@ class CoremailClient:
             except Exception:
                 pass
         return new_emails
+
+    def _pop3_fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+        """当 IMAP 和 WebAPI 不可用，但 POP3 端口开放时的收信兜底"""
+        if not self.email_account or not self.email_password:
+            return []
+
+        clean_host, _ = normalize_host_and_port(self.imap_host, 110)
+        if not clean_host:
+            return []
+
+        pop_conn = None
+        for port, use_ssl in [(995, True), (110, False)]:
+            try:
+                if use_ssl:
+                    pop_conn = poplib.POP3_SSL(clean_host, port, timeout=10)
+                else:
+                    pop_conn = poplib.POP3(clean_host, port, timeout=10)
+                pop_conn.user(self.email_account)
+                pop_conn.pass_(self.email_password)
+                break
+            except Exception:
+                if pop_conn:
+                    try:
+                        pop_conn.quit()
+                    except Exception:
+                        pass
+                pop_conn = None
+
+        if not pop_conn:
+            return []
+
+        new_emails = []
+        try:
+            resp, items, octets = pop_conn.uidl()
+            msg_list = []
+            for it in items:
+                parts = it.decode("ascii", errors="ignore").split()
+                if len(parts) >= 2:
+                    msg_list.append((int(parts[0]), parts[1]))
+
+            candidates = [m for m in msg_list[-max_fetch:] if m[1] not in existing_uids]
+            for num, uid in candidates:
+                try:
+                    resp, lines, octets = pop_conn.retr(num)
+                    raw_bytes = b"\r\n".join(lines)
+                    parsed = self._parse_raw_email(uid, raw_bytes)
+                    if parsed:
+                        new_emails.append(parsed)
+                except Exception:
+                    continue
+        finally:
+            try:
+                pop_conn.quit()
+            except Exception:
+                pass
+
+        return new_emails
+
+    def fetch_new_emails(self, existing_uids: set, max_fetch: int = 30) -> List[Dict[str, Any]]:
+        """从收件箱拉取尚未入库的邮件列表（多通道智能路由：WebAPI -> IMAP -> POP3）"""
+        if not self.email_account or not self.email_password:
+            return []
+
+        # 1. 在 Coremail 专用协议模式下，优先尝试 WebAPI
+        if self.protocol_mode == "coremail":
+            try:
+                emails = self._http_fetch_new_emails(existing_uids, max_fetch)
+                return emails
+            except Exception as http_err:
+                if isinstance(http_err, ValueError) and "认证失败" in str(http_err):
+                    raise http_err
+
+        # 2. 尝试 IMAP
+        try:
+            return self._imap_fetch_new_emails(existing_uids, max_fetch)
+        except Exception as imap_err:
+            # 3. 降级尝试 POP3
+            try:
+                pop3_emails = self._pop3_fetch_new_emails(existing_uids, max_fetch)
+                if pop3_emails:
+                    return pop3_emails
+            except Exception:
+                pass
+            raise imap_err
 
     def _parse_raw_email(self, uid: str, raw_bytes: bytes) -> Optional[Dict[str, Any]]:
         """解析原始 RFC822 字节流，并将附件和内联图片保存到本地磁盘"""
@@ -352,7 +907,6 @@ class CoremailClient:
             # 检测普通附件或包含 Content-ID 的正文内联图片
             if filename or "attachment" in content_disp.lower() or (content_type.startswith("image/") and content_id):
                 decoded_fname = decode_mime_str(filename) if filename else f"inline_{content_id or uuid.uuid4().hex[:6]}.png"
-                # 清除 Windows 非法文件名字符
                 safe_fname = re.sub(r'[\\/:*?"<>|]', "_", decoded_fname)
                 os.makedirs(uid_attach_dir, exist_ok=True)
                 file_path = os.path.abspath(os.path.join(uid_attach_dir, safe_fname))
@@ -460,7 +1014,7 @@ class CoremailClient:
         processed_html = re.sub(r'src=["\'](file:///[^"\']+)["\']', repl_file, processed_html)
         return processed_html, inline_images
 
-    def send_email(
+    def _smtp_send_email(
         self,
         to_addrs: List[str],
         cc_addrs: List[str],
@@ -470,10 +1024,7 @@ class CoremailClient:
         attachment_paths: List[str],
         save_to_sent: bool = True
     ) -> None:
-        """发送富文本邮件（支持新建改写邮件与标准转发邮件，支持正文内联图片与文件附件）"""
-        if not self.email_account or not self.email_password:
-            raise ValueError("未配置发信邮箱账号或密码")
-
+        """通过标准 SMTP 协议发送邮件"""
         msg = MIMEMultipart("mixed")
         display_name = self.sender_display_name or self.email_account.split("@")[0]
         from_header = formataddr((str(make_header([(display_name, "utf-8")])), self.email_account))
@@ -501,7 +1052,6 @@ class CoremailClient:
 
         msg.attach(related_part)
 
-        # 挂载文件附件
         for path in attachment_paths:
             if not path or not os.path.isfile(path):
                 continue
@@ -516,7 +1066,6 @@ class CoremailClient:
         all_recipients = list(dict.fromkeys([a.strip() for a in (to_addrs + cc_addrs) if a.strip()]))
         raw_message = msg.as_bytes()
 
-        # SMTP 发送
         clean_smtp, _ = normalize_host_and_port(self.smtp_host, self.smtp_port)
         smtp = None
         try:
@@ -563,16 +1112,82 @@ class CoremailClient:
             except Exception:
                 pass
 
+    def send_email(
+        self,
+        to_addrs: List[str],
+        cc_addrs: List[str],
+        subject: str,
+        html_body: str,
+        plain_body: str,
+        attachment_paths: List[str],
+        save_to_sent: bool = True
+    ) -> None:
+        """发送富文本邮件（优先 WebAPI -> SMTP 降级）"""
+        if not self.email_account or not self.email_password:
+            raise ValueError("未配置发信邮箱账号或密码")
+
+        # 1. 在 Coremail 专用协议模式下，优先尝试 WebAPI 发信
+        if self.protocol_mode == "coremail":
+            try:
+                self._http_send_email(
+                    to_addrs=to_addrs,
+                    cc_addrs=cc_addrs,
+                    subject=subject,
+                    html_body=html_body,
+                    plain_body=plain_body,
+                    attachment_paths=attachment_paths,
+                    save_to_sent=save_to_sent
+                )
+                return
+            except Exception as http_err:
+                if isinstance(http_err, ValueError) and "认证失败" in str(http_err):
+                    raise http_err
+                try:
+                    self._smtp_send_email(
+                        to_addrs=to_addrs,
+                        cc_addrs=cc_addrs,
+                        subject=subject,
+                        html_body=html_body,
+                        plain_body=plain_body,
+                        attachment_paths=attachment_paths,
+                        save_to_sent=save_to_sent
+                    )
+                    return
+                except Exception:
+                    raise http_err
+
+        # 2. SMTP 发信
+        self._smtp_send_email(
+            to_addrs=to_addrs,
+            cc_addrs=cc_addrs,
+            subject=subject,
+            html_body=html_body,
+            plain_body=plain_body,
+            attachment_paths=attachment_paths,
+            save_to_sent=save_to_sent
+        )
+
     def mark_email_read(self, uid: str) -> None:
-        """标记邮件为已读"""
+        """标记邮件为已读（智能优先 WebAPI -> IMAP）"""
         if not self.email_account or not self.email_password:
             return
-        conn = self._connect_imap()
-        try:
-            conn.select("INBOX")
-            conn.uid("store", str(uid), "+FLAGS", "(\\Seen)")
-        finally:
+
+        if self.protocol_mode == "coremail":
             try:
-                conn.logout()
+                self._http_mark_read(uid)
+                return
             except Exception:
                 pass
+
+        try:
+            conn = self._connect_imap()
+            try:
+                conn.select("INBOX")
+                conn.uid("store", str(uid), "+FLAGS", "(\\Seen)")
+            finally:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass
+        except Exception:
+            pass

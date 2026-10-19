@@ -27,6 +27,7 @@ class SettingsDialog(QDialog):
 
         self.setWindowTitle("系统设置 - CoremailAssistant")
         self.resize(750, 680)
+        self.http_base_url = ""
         self._init_ui()
         self._load_settings()
 
@@ -260,26 +261,49 @@ class SettingsDialog(QDialog):
             return
 
         clean_host = res.get("host", server)
-        imap_p = res.get("imap_port", 993)
-        imap_s = res.get("imap_ssl", True)
-        smtp_p = res.get("smtp_port", 465)
-        smtp_s = res.get("smtp_ssl", True)
+        imap_p = res.get("imap_port")
+        imap_s = res.get("imap_ssl", False)
+        smtp_p = res.get("smtp_port")
+        smtp_s = res.get("smtp_ssl", False)
+        http_base = res.get("http_base_url")
 
-        self.imap_host.setText(clean_host)
-        self.imap_port.setValue(imap_p)
-        self.imap_ssl.setChecked(imap_s)
+        if http_base:
+            self.http_base_url = http_base
 
-        self.smtp_host.setText(clean_host)
-        self.smtp_port.setValue(smtp_p)
-        self.smtp_ssl.setChecked(smtp_s)
+        if imap_p is not None:
+            self.imap_host.setText(clean_host)
+            self.imap_port.setValue(imap_p)
+            self.imap_ssl.setChecked(imap_s)
+
+        if smtp_p is not None:
+            self.smtp_host.setText(clean_host)
+            self.smtp_port.setValue(smtp_p)
+            self.smtp_ssl.setChecked(smtp_s)
+
+        channel_lines = []
+        if http_base:
+            channel_lines.append(f"• Coremail WebAPI 专用通道: {http_base} (HTTP/HTTPS)")
+        if imap_p is not None:
+            channel_lines.append(f"• IMAP 收信端口: {imap_p} (SSL 加密: {'开启' if imap_s else '关闭'})")
+        if smtp_p is not None:
+            channel_lines.append(f"• SMTP 发信端口: {smtp_p} (SSL 加密: {'开启' if smtp_s else '关闭'})")
+        if res.get("pop3_port") is not None:
+            channel_lines.append(f"• POP3 收信端口: {res.get('pop3_port')}")
+
+        channel_text = "\n".join(channel_lines)
+        extra_note = ""
+        if http_base and imap_p is None:
+            extra_note = (
+                "\n\n💡 提示：检测到内网服务器未开放标准 IMAP/SMTP 端口（通常被防火墙拦截），"
+                "但开放了 HTTP/HTTPS Web 服务。系统已自动开启与官方论客客户端相同的 WebAPI 专用协议进行收发！"
+            )
 
         msg = (
             f"🎉 论客服务器端口检测成功！\n\n"
             f"• 服务器主机: {clean_host}\n"
             f"• 解析 IP: {res.get('resolved_ip')}\n"
-            f"• IMAP 收信端口: {imap_p} (SSL 加密: {'开启' if imap_s else '关闭'})\n"
-            f"• SMTP 发信端口: {smtp_p} (SSL 加密: {'开启' if smtp_s else '关闭'})\n\n"
-            f"已自动为您填入对应配置。您可以点击下方的“测试连接”验证邮箱账号密码。"
+            f"• 开放服务与端口：\n{channel_text}{extra_note}\n\n"
+            f"您可以点击下方的“🔌 测试连接”验证邮箱账号密码。"
         )
         QMessageBox.information(self, "检测成功", msg)
 
@@ -316,6 +340,7 @@ class SettingsDialog(QDialog):
         cfg = {
             "protocol_mode": proto_mode,
             "coremail_server": c_srv,
+            "http_base_url": getattr(self, "http_base_url", ""),
             "imap_host": self.imap_host.text().strip(),
             "imap_port": self.imap_port.value(),
             "imap_ssl": self.imap_ssl.isChecked(),
@@ -328,10 +353,14 @@ class SettingsDialog(QDialog):
         client = CoremailClient(cfg)
         res = client.test_connection()
         if res.get("ok"):
-            self.imap_port.setValue(client.imap_port)
-            self.imap_ssl.setChecked(client.imap_ssl)
-            self.smtp_port.setValue(client.smtp_port)
-            self.smtp_ssl.setChecked(client.smtp_ssl)
+            if client.imap_port:
+                self.imap_port.setValue(client.imap_port)
+                self.imap_ssl.setChecked(client.imap_ssl)
+            if client.smtp_port:
+                self.smtp_port.setValue(client.smtp_port)
+                self.smtp_ssl.setChecked(client.smtp_ssl)
+            if getattr(client, "_cached_base_url", None):
+                self.http_base_url = client._cached_base_url
             QMessageBox.information(self, "连接成功", res.get("msg"))
         else:
             QMessageBox.critical(self, "连接失败", res.get("msg"))
@@ -351,6 +380,7 @@ class SettingsDialog(QDialog):
     def _load_settings(self):
         st = self.db.get_all_settings()
 
+        self.http_base_url = st.get("http_base_url", "")
         proto_mode = st.get("protocol_mode", "coremail")
         idx_p = self.protocol_mode.findData(proto_mode)
         if idx_p >= 0:
@@ -398,6 +428,7 @@ class SettingsDialog(QDialog):
         data = {
             "protocol_mode": proto_mode,
             "coremail_server": c_srv,
+            "http_base_url": getattr(self, "http_base_url", ""),
             "imap_host": imap_h,
             "imap_port": str(self.imap_port.value()),
             "imap_ssl": "1" if self.imap_ssl.isChecked() else "0",

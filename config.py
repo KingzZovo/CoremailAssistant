@@ -25,6 +25,7 @@ DEFAULT_SETTINGS = {
     # 论客邮箱 (Coremail) 协议与统一服务器配置 (适配论客客户端专用协议与单地址模式)
     "protocol_mode": "coremail",         # 'coremail': 专用单地址协议 (同论客客户端), 'imap_smtp': 标准手动端口
     "coremail_server": "",               # Coremail 统一服务器地址 (IP或域名)
+    "http_base_url": "",                 # Coremail WebAPI 探测或指定的根 URL (如 http://10.x.x.x:8080)
 
     # 论客邮箱 (Coremail) IMAP 收信服务
     "imap_host": "mail.example.com",
